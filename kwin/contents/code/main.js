@@ -50,6 +50,7 @@ function read() {
     send("ReadOrStop", JSON.stringify({
         point: [Math.round(point.x), Math.round(point.y)],
         screen: screen ? geometry(screen.geometry) : null,
+        desktop: geometry(workspace.virtualScreenGeometry),
         active: describe(workspace.activeWindow),
         hovered: describe(windowAt(point))
     }));

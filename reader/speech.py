@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import select
@@ -12,6 +13,24 @@ import time
 
 LOG = logging.getLogger(__name__)
 VOICE = "en_US-lessac-medium"
+CUE_RATE = 24000
+
+
+def cue_samples(notes):
+    samples = []
+    for frequency, duration in notes:
+        frames = round(CUE_RATE * duration)
+        fade = round(CUE_RATE * 0.008)
+        for i in range(frames):
+            envelope = min(i / fade, (frames - 1 - i) / fade, 1)
+            samples.append(round(5000 * envelope * math.sin(math.tau * frequency * i / CUE_RATE)))
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+CUES = {
+    "accepted": cue_samples(((660, 0.045), (880, 0.060))),
+    "unavailable": cue_samples(((440, 0.070), (330, 0.100))),
+}
 
 
 class Cancelled(Exception):
@@ -38,6 +57,13 @@ class Voice:
     @property
     def name(self):
         return "Piper" if self.use_piper else "eSpeak NG"
+
+    def play_cue(self, cue):
+        subprocess.run(
+            [self.player, "--client-name=Select to Speak", "--stream-name=Shortcut feedback",
+             "--latency-msec=60", "--raw", "--format=s16le", f"--rate={CUE_RATE}", "--channels=1"],
+            input=CUES[cue], timeout=2, check=True,
+        )
 
     def warm(self):
         if self.use_piper and self.process is None:

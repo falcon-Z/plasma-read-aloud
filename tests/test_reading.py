@@ -104,18 +104,32 @@ class ReadingTests(unittest.TestCase):
     def test_ocr_can_capture_a_non_active_popup_on_a_scaled_monitor(self):
         request = {
             "screen": [-100, 0, 100, 80],
+            "desktop": [-100, 0, 200, 80],
             "active": {"frame": [0, 0, 100, 80]},
             "hovered": {"frame": [-110, 5, 40, 20]},
         }
         mode, source, bounds = ocr.capture_region(request)
-        self.assertEqual(mode, ["--current"])
+        self.assertEqual(mode, ["--fullscreen", "--scaled"])
+        self.assertEqual(source, Rect(-100, 0, 200, 80))
         self.assertEqual(bounds, Rect(-100, 5, 30, 20))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "monitor.png"
-            pixbuf = ocr.GdkPixbuf.Pixbuf.new(ocr.GdkPixbuf.Colorspace.RGB, False, 8, 200, 160)
-            pixbuf.fill(0xFFFFFFFF)
-            pixbuf.savev(str(path), "png", [], [])
-            self.assertEqual(ocr.crop(path, source, bounds), (60, 40))
+        pixbuf = ocr.GdkPixbuf.Pixbuf.new(ocr.GdkPixbuf.Colorspace.RGB, False, 8, 400, 160)
+        pixbuf.fill(0xFFFFFFFF)
+        pixbuf.new_subpixbuf(0, 10, 60, 40).fill(0xF009C9FF)
+        cropped = ocr.crop(pixbuf, source, bounds)
+        self.assertEqual((cropped.get_width(), cropped.get_height()), (60, 40))
+        self.assertEqual(bytes(cropped.get_pixels()[:3]), bytes((240, 9, 201)))
+        self.assertIsNone(ocr.crop(pixbuf, Rect(-100, 0, 202, 80), bounds))
+
+    def test_ocr_highlights_only_the_current_sentence_by_line(self):
+        reading = ocr.ImageReading([
+            ocr.Word("Read", Rect(10, 20, 30, 10), (1,), (1, 1)),
+            ocr.Word("these", Rect(45, 21, 30, 10), (1,), (1, 1)),
+            ocr.Word("words.", Rect(10, 40, 35, 10), (1,), (1, 2)),
+            ocr.Word("Next.", Rect(50, 40, 30, 10), (1,), (1, 2)),
+        ])
+        first, second = reading.utterances()
+        self.assertEqual(reading.rectangles(first), [Rect(10, 20, 65, 11), Rect(10, 40, 35, 10)])
+        self.assertEqual(reading.rectangles(second), [Rect(50, 40, 30, 10)])
 
     def test_saved_rate_takes_precedence_over_initial_default(self):
         with tempfile.TemporaryDirectory() as directory:

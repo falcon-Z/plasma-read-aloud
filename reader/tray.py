@@ -13,6 +13,13 @@ WATCHER = "org.kde.StatusNotifierWatcher"
 WATCHER_PATH = "/StatusNotifierWatcher"
 DISPLAY_NAME = "Select to Speak"
 ICON = "audio-headphones-symbolic"
+STATUS_TEXT = {
+    "idle": "Alt+Esc to read",
+    "finding text": "Finding text…",
+    "recognizing text": "Recognizing text…",
+    "preparing audio": "Preparing audio…",
+    "speaking": "Reading aloud",
+}
 XML = f"""
 <node>
   <interface name="{ITEM}">
@@ -40,7 +47,7 @@ class Tray:
         self.stop = stop
         self.window = None
         self.rate = MIN_RATE
-        self.active = False
+        self.phase = "idle"
         self.activation_token = ""
         self.info = Gio.DBusNodeInfo.new_for_xml(XML)
         bus.register_object(ITEM_PATH, self.info.interfaces[0], self.handle, self.get_property, None)
@@ -63,7 +70,7 @@ class Tray:
 
     def get_property(self, bus, sender, path, interface, name):
         if name == "ToolTip":
-            phase = "Reading aloud" if self.active else "Alt+Esc to read"
+            phase = STATUS_TEXT[self.phase]
             return GLib.Variant("(sa(iiay)ss)", (ICON, [], DISPLAY_NAME, f"{phase} · {self.rate:.2f}×"))
         if name == "ItemIsMenu":
             return GLib.Variant("b", False)
@@ -124,7 +131,7 @@ class Tray:
         hint.add_css_class("dim-label")
         hint.add_css_class("caption")
         footer.append(hint)
-        self.stop_button = Gtk.Button(label="Stop reading", sensitive=self.active)
+        self.stop_button = Gtk.Button(label="Stop reading", sensitive=self.phase != "idle")
         self.stop_button.connect("clicked", lambda *_: self.stop())
         footer.append(self.stop_button)
         self.error = Gtk.Label(xalign=0, wrap=True, visible=False)
@@ -148,11 +155,11 @@ class Tray:
             self.rate_slider.handler_block(self.slider_handler)
             self.rate_slider.set_value(self.rate)
             self.rate_slider.handler_unblock(self.slider_handler)
-        self.stop_button.set_sensitive(self.active)
+        self.stop_button.set_sensitive(self.phase != "idle")
 
-    def update(self, active, rate):
-        if (self.active, self.rate) == (active, rate):
+    def update(self, phase, rate):
+        if (self.phase, self.rate) == (phase, rate):
             return
-        self.active, self.rate = active, rate
+        self.phase, self.rate = phase, rate
         self.sync_window()
         self.bus.emit_signal(None, ITEM_PATH, ITEM, "NewToolTip", None)

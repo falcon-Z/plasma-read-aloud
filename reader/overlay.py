@@ -19,7 +19,8 @@ class ScreenHighlight:
         window = self.window = Gtk.Window(decorated=False, focusable=False)
         window.add_css_class("reading-highlight")
         Layer.init_for_window(window)
-        Layer.set_namespace(window, "select-to-speak-highlight")
+        # KWin recognizes this role and skips the normal window-open animation.
+        Layer.set_namespace(window, "on-screen-display")
         Layer.set_layer(window, Layer.Layer.OVERLAY)
         Layer.set_keyboard_mode(window, Layer.KeyboardMode.NONE)
         Layer.set_exclusive_zone(window, -1)

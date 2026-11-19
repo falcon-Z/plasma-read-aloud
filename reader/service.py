@@ -6,19 +6,20 @@ import logging
 import os
 from pathlib import Path
 import signal
+import subprocess
 import threading
 
 from gi.repository import Gio, GLib, GLibUnix
 
 from . import access, ocr
-from .overlay import Highlight
 from .settings import load_rate, normalize_rate, save_rate
 from .speech import Cancelled, Voice
-from .tray import Tray
 
 NAME = "org.kde.SelectToSpeak"
 PATH = "/SelectToSpeak"
 LOG = logging.getLogger("select-to-speak")
+EMPTY = ("Nothing readable here", "Point at text or a control, or select some text and try again.")
+FAILED = ("Couldn't read aloud", "Press Alt+Esc to try again.")
 INTERFACE = f"""
 <node>
   <interface name="{NAME}">
@@ -37,12 +38,16 @@ INTERFACE = f"""
 
 class Reader:
     def __init__(self, base, settings):
+        from .overlay import Highlight
+
         self.base = base
         self.settings = settings
         self.rate = load_rate(settings)
         self.highlight = Highlight()
         self.voice = Voice(base)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.cues = (concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                     if os.environ.get("SELECT_TO_SPEAK_AUDIO_CUES", "1") != "0" else None)
         self.job = None
         self.phase = "idle"
         self.tray = None
@@ -50,59 +55,77 @@ class Reader:
         self.locked = False
 
     def attach_tray(self, bus):
+        from .tray import Tray
+
         self.tray = Tray(bus, self.change_rate, self.stop)
-        self.tray.update(False, self.rate)
+        self.tray.update(self.phase, self.rate)
 
     def change_rate(self, rate):
         rate = normalize_rate(rate)
         if rate != self.rate or not self.settings.exists():
             save_rate(self.settings, rate)
         self.rate = rate
-        self.tray.update(self.job is not None, self.rate)
+        self.tray.update(self.phase, self.rate)
 
     def start(self, request):
-        if self.job is not None:
-            self.stop()
-            return
         if self.locked:
             return
+        if self.job is not None:
+            if self.phase == "speaking":
+                self.stop()
+            return
         cancel = self.job = threading.Event()
-        self.phase = "finding text"
-        self.tray.update(True, self.rate)
+        self.update(cancel, "finding text")
+        self.cue("accepted", cancel)
         self.pool.submit(self.run, request, cancel)
 
     def stop(self):
-        if self.job is None:
-            return
-        self.job.set()
-        self.job = None
-        self.phase = "idle"
-        self.highlight.update([])
-        self.tray.update(False, self.rate)
+        if self.job is not None:
+            self.job.set()
+            self.update(self.job, "idle", [])
 
-    def update(self, cancel, phase, boxes):
+    def update(self, cancel, phase, boxes=None):
         if self.job is not cancel:
             return
         self.phase = phase
-        self.highlight.update(boxes)
         if phase == "idle":
             self.job = None
-            self.tray.update(False, self.rate)
+        if boxes is not None:
+            self.highlight.update(boxes)
+        self.tray.update(phase, self.rate)
+
+    def cue(self, kind, cancel):
+        if self.cues is not None:
+            self.cues.submit(self.play_cue, kind, cancel)
+
+    def play_cue(self, kind, cancel):
+        if not cancel.is_set():
+            try:
+                self.voice.play_cue(kind)
+            except (OSError, subprocess.SubprocessError) as exc:
+                LOG.warning("Could not play shortcut feedback: %s", exc)
+
+    def finish(self, cancel, outcome):
+        if self.job is not cancel:
+            return
+        self.update(cancel, "idle", [])
+        if outcome is not None:
+            self.cue("unavailable", cancel)
+            self.notify(*outcome)
 
     def lock_changed(self, bus, sender, path, interface, member, data):
         self.locked, = data.unpack()
         if self.locked:
             self.stop()
 
-    def notify_empty(self):
+    def notify(self, summary, body):
         try:
             bus = Gio.bus_get_sync(Gio.BusType.SESSION)
             bus.call(
                 "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications", "Notify",
                 GLib.Variant("(susssasa{sv}i)", (
-                    "Select to Speak", 0, "text-to-speech", "Nothing readable here",
-                    "Point at text or a control, or select some text and try again.", [],
+                    "Select to Speak", 0, "text-to-speech", summary, body, [],
                     {"transient": GLib.Variant("b", True)}, 2500,
                 )), None, Gio.DBusCallFlags.NONE, 750, None, None, None,
             )
@@ -114,59 +137,84 @@ class Reader:
             if cancel.is_set():
                 raise Cancelled
 
+        outcome = None
+        audio_pending = False
         try:
+            check()
             reading = access.resolve(request, check)
             remaining = iter(reading.utterances()) if reading else iter(())
             current = next(remaining, None)
             if current is None:
+                check()
+                GLib.idle_add(self.update, cancel, "recognizing text")
                 reading = ocr.capture(request, self.base, cancel)
                 remaining = iter(reading.utterances()) if reading else iter(())
                 current = next(remaining, None)
             check()
             if current is None:
-                self.notify_empty()
+                LOG.info("No readable text at the requested target")
+                outcome = EMPTY
                 return
             LOG.info("Reading from %s using %s", reading.mode, self.voice.name)
+            GLib.idle_add(self.update, cancel, "preparing audio")
+            scroll = request.get("active") == request.get("hovered") and reading.mode == "pointer"
+            highlight = True
             queued_rate = self.rate
             self.voice.queue(current.text, queued_rate)
+            audio_pending = True
             while current is not None:
                 wav = self.voice.receive(current.text, queued_rate, cancel)
+                audio_pending = False
                 check()
                 requested_rate = self.rate
                 if requested_rate != queued_rate:
                     queued_rate = requested_rate
                     self.voice.queue(current.text, queued_rate)
+                    audio_pending = True
                     continue
                 following = next(remaining, None)
                 if following is not None:
                     self.voice.queue(following.text, queued_rate)
-                boxes = reading.rectangles(current, scroll=reading.mode in {"selection", "caret", "pointer"})
+                    audio_pending = True
                 check()
                 previous_boxes = None
 
                 def refresh():
-                    nonlocal previous_boxes
+                    nonlocal highlight, previous_boxes
                     check()
-                    visible = boxes if previous_boxes is None else reading.rectangles(current)
-                    if previous_boxes != visible:
-                        GLib.idle_add(self.update, cancel, "speaking", visible)
-                    previous_boxes = visible
+                    if not highlight:
+                        return
+                    try:
+                        boxes = reading.rectangles(current, scroll=scroll and previous_boxes is None)
+                    except Exception:
+                        LOG.exception("Could not update the reading highlight")
+                        highlight = False
+                        boxes = []
+                    if previous_boxes != boxes:
+                        GLib.idle_add(self.update, cancel, "speaking", boxes)
+                    previous_boxes = boxes
 
+                GLib.idle_add(self.update, cancel, "speaking")
                 self.voice.play(wav, cancel, refresh)
                 current = following
         except access.ProtectedText:
-            self.notify_empty()
+            outcome = EMPTY
         except Cancelled:
-            self.voice.close()
+            LOG.info("Read request cancelled")
+            if audio_pending:
+                self.voice.close()
         except Exception:
             self.voice.close()
             LOG.exception("Reading failed")
+            outcome = FAILED
         finally:
-            GLib.idle_add(self.update, cancel, "idle", [])
+            GLib.idle_add(self.finish, cancel, outcome)
 
     def close(self, *_):
         self.stop()
         self.pool.shutdown(wait=True, cancel_futures=True)
+        if self.cues is not None:
+            self.cues.shutdown(wait=True, cancel_futures=True)
         self.voice.close()
         self.loop.quit()
         return False
@@ -203,9 +251,10 @@ def validate(request):
 
     if not isinstance(request, dict) or not integers(request.get("point"), 2):
         raise ValueError
-    screen = request.get("screen")
-    if screen is not None and (not integers(screen, 4) or min(screen[2:]) <= 0):
-        raise ValueError
+    for key in ("screen", "desktop"):
+        geometry = request.get(key)
+        if geometry is not None and (not integers(geometry, 4) or min(geometry[2:]) <= 0):
+            raise ValueError
     if "pointerOnly" in request and type(request["pointerOnly"]) is not bool:
         raise ValueError
     for key in ("active", "hovered"):

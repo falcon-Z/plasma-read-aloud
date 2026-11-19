@@ -3,20 +3,26 @@
 from dataclasses import dataclass
 import csv
 import io
+from itertools import groupby, takewhile
+import logging
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
 import gi
 
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import GdkPixbuf, GLib
+from gi.repository import GdkPixbuf, Gio, GLib
 
 from .model import Piece, Rect, passages
 from .speech import Cancelled, reap
+
+LOG = logging.getLogger(__name__)
+SCREENSHOT = "org.kde.KWin.ScreenShot2"
 
 
 @dataclass(frozen=True)
@@ -38,12 +44,21 @@ class ImageReading:
         for index, word in enumerate(self.words):
             if index:
                 pieces.append(Piece(" " if word.paragraph == previous else "\n"))
-            pieces.append(Piece(word.text, word.box, -1))
+            pieces.append(Piece(word.text, word, -1))
             previous = word.paragraph
         return passages(pieces)
 
     def rectangles(self, utterance, scroll=False):
-        return [piece.node for piece in utterance.pieces]
+        words = (piece.node for piece in utterance.pieces)
+        boxes = []
+        for _, line in groupby(words, key=lambda word: word.line):
+            bounds = [word.box for word in line]
+            x = min(box.x for box in bounds)
+            y = min(box.y for box in bounds)
+            right = max(box.x + box.w for box in bounds)
+            bottom = max(box.y + box.h for box in bounds)
+            boxes.append(Rect(x, y, right - x, bottom - y))
+        return boxes
 
 
 def parse(tsv, image_size, bounds):
@@ -85,18 +100,19 @@ def at_point(words, point):
     return words[min(nearest)[1]:] if nearest else []
 
 
-def command(argv, cancel, seconds):
-    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+def command(argv, cancel, seconds, payload=None, env=None):
+    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, env=env) as process:
         try:
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
                 if cancel.is_set():
                     raise Cancelled
                 try:
-                    output, _ = process.communicate(timeout=0.08)
+                    output, _ = process.communicate(payload, timeout=0.08)
                     return output if process.returncode == 0 else None
                 except subprocess.TimeoutExpired:
-                    pass
+                    payload = None
             return None
         finally:
             reap(process)
@@ -107,6 +123,8 @@ def capture_region(request):
     if request.get("screen"):
         screen = Rect(*request["screen"])
         bounds = screen.intersect(Rect(*hovered["frame"])) if hovered else screen
+        if request.get("desktop"):
+            return ["--fullscreen", "--scaled"], Rect(*request["desktop"]), bounds
         return ["--current"], screen, bounds
     if active and hovered == active:
         bounds = Rect(*active["client"])
@@ -114,22 +132,102 @@ def capture_region(request):
     return [], None, None
 
 
-def crop(png, source, bounds):
-    image = GdkPixbuf.Pixbuf.new_from_file(str(png))
+def crop(image, source, bounds):
     width, height = image.get_width(), image.get_height()
-    if abs((width / height) / (source.w / source.h) - 1) > 0.06:
+    if abs(width * source.h - height * source.w) > max(source.w, source.h):
+        return None
+    if not bounds.valid or bounds.intersect(source) != bounds:
         return None
     if bounds == source:
-        return width, height
+        return image
     x = round((bounds.x - source.x) * width / source.w)
     y = round((bounds.y - source.y) * height / source.h)
     right = round((bounds.x + bounds.w - source.x) * width / source.w)
     bottom = round((bounds.y + bounds.h - source.y) * height / source.h)
     if right <= x or bottom <= y:
         return None
-    cropped = image.new_subpixbuf(x, y, right - x, bottom - y)
-    cropped.savev(str(png), "png", [], [])
-    return cropped.get_width(), cropped.get_height()
+    return image.new_subpixbuf(x, y, right - x, bottom - y)
+
+
+def decode_frame(pixels, width, height, stride, format):
+    # QImage's RGB32 formats use native word order. RGBX8888 and RGBA8888
+    # use byte order and can be passed to GdkPixbuf directly.
+    if format in (4, 5, 6):
+        rgba = bytearray(pixels)
+        if sys.byteorder == "little":
+            rgba[0::4], rgba[2::4] = pixels[2::4], pixels[0::4]
+            rgba[3::4] = b"\xff" * (len(pixels) // 4)
+        else:
+            rgba[0::4], rgba[1::4], rgba[2::4] = pixels[1::4], pixels[2::4], pixels[3::4]
+            rgba[3::4] = b"\xff" * (len(pixels) // 4)
+        pixels = bytes(rgba)
+    return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(pixels), GdkPixbuf.Colorspace.RGB,
+                                           True, 8, width, height, stride)
+
+
+def capture_area(bounds, cancel):
+    with os.fdopen(os.memfd_create("select-to-speak-ocr"), "r+b") as image:
+        fd = image.fileno()
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+            file_list = Gio.UnixFDList.new()
+            args = GLib.Variant("(iiuua{sv}h)", (bounds.x, bounds.y, bounds.w, bounds.h, {}, file_list.append(fd)))
+            reply, _ = bus.call_with_unix_fd_list_sync(
+                SCREENSHOT, "/org/kde/KWin/ScreenShot2", SCREENSHOT, "CaptureArea",
+                args, None, Gio.DBusCallFlags.NO_AUTO_START, 1200, file_list, None,
+            )
+        except GLib.Error as exc:
+            LOG.debug("Direct KWin capture unavailable: %s", exc.message)
+            return None
+        meta, = reply.unpack()
+        width, height = meta.get("width"), meta.get("height")
+        stride, format = meta.get("stride"), meta.get("format")
+        if ((width, height) != (bounds.w, bounds.h) or meta.get("type") != "raw"
+                or format not in (4, 5, 6, 16, 17, 18) or not isinstance(stride, int)
+                or stride < width * 4 or stride % 4):
+            LOG.debug("KWin returned an unsupported screenshot layout")
+            return None
+        size = stride * height
+        deadline = time.monotonic() + 0.5
+        while os.fstat(fd).st_size < size:
+            if cancel.wait(0.01):
+                raise Cancelled
+            if time.monotonic() >= deadline:
+                return None
+        return decode_frame(os.pread(fd, size, 0), width, height, stride, format)
+
+
+def capture_spectacle(options, source, bounds, cancel):
+    spectacle = shutil.which("spectacle")
+    if not spectacle:
+        return None
+    env = os.environ.copy()
+    for key in ("XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"):
+        env.pop(key, None)
+    with tempfile.TemporaryDirectory(prefix="select-to-speak-", dir=os.environ.get("XDG_RUNTIME_DIR")) as folder:
+        path = Path(folder) / "capture.png"
+        result = command([spectacle, "--new-instance", "-b", "-n", *options, "-o", str(path)],
+                         cancel, 3, env=env)
+        if result is None or not path.is_file():
+            return None
+        try:
+            return crop(GdkPixbuf.Pixbuf.new_from_file(str(path)), source, bounds)
+        except GLib.Error:
+            return None
+
+
+def recognize(image, tesseract, language, layout, bounds, point, cancel):
+    _, png = image.save_to_bufferv("png", [], [])
+    output = command([tesseract, "stdin", "stdout", "-l", language, "--psm", layout, "tsv"],
+                     cancel, 3, payload=png)
+    if not output:
+        return []
+    size = image.get_width(), image.get_height()
+    words = at_point(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
+    if not words:
+        return []
+    paragraph = words[0].paragraph
+    return list(takewhile(lambda word: word.paragraph == paragraph, words))
 
 
 def capture(request, base, cancel):
@@ -139,34 +237,34 @@ def capture(request, base, cancel):
     point = request["point"]
     if bounds is None or not bounds.contains(*point):
         return None
-    spectrum = shutil.which("spectacle")
     tesseract = shutil.which("tesseract")
     local = base / "runtime/ocr/usr/bin/tesseract"
     if tesseract is None and local.is_file():
         tesseract = str(local)
-    if not spectrum or not tesseract:
+    if not tesseract:
         return None
-    with tempfile.TemporaryDirectory(prefix="select-to-speak-", dir=os.environ.get("XDG_RUNTIME_DIR")) as folder:
-        png = Path(folder) / "window.png"
-        command([spectrum, "-b", "-n", *options, "-o", str(png)], cancel, 3)
-        deadline = time.monotonic() + 2
-        while not png.is_file():
-            if cancel.wait(0.06):
-                raise Cancelled
-            if time.monotonic() >= deadline:
-                return None
-        try:
-            size = crop(png, source, bounds)
-        except GLib.Error:
-            return None
-        if size is None:
-            return None
-        language = os.environ.get("SELECT_TO_SPEAK_OCR_LANGUAGE", "eng")
-        for layout in ("3", "11"):
-            output = command([tesseract, str(png), "stdout", "-l", language,
-                              "--psm", layout, "tsv"], cancel, 10)
-            if output:
-                words = at_point(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
-                if words:
-                    return ImageReading(words)
+    x, y = point
+    bounds = bounds.intersect(Rect(bounds.x, y - 120, bounds.w, 480))
+    image = capture_area(bounds, cancel)
+    if image is None:
+        image = capture_spectacle(options, source, bounds, cancel)
+    if image is None:
+        LOG.info("OCR could not capture the requested area")
         return None
+    language = os.environ.get("SELECT_TO_SPEAK_OCR_LANGUAGE", "eng")
+    words = recognize(image, tesseract, language, "3", bounds, point, cancel)
+    if words:
+        return ImageReading(words)
+
+    # Retry on an enlarged tile around small or sparsely laid out text.
+    tile = bounds.intersect(Rect(x - 360, y - 48, 721, 97))
+    detail = crop(image, bounds, tile)
+    if detail is None:
+        return None
+    enlarged = detail.scale_simple(detail.get_width() * 2, detail.get_height() * 2, GdkPixbuf.InterpType.BILINEAR)
+    for layout in ("6", "11"):
+        words = recognize(enlarged, tesseract, language, layout, tile, point, cancel)
+        if words:
+            return ImageReading(words)
+    LOG.info("OCR found no text near the pointer")
+    return None

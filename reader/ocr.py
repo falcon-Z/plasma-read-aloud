@@ -1,4 +1,4 @@
-"""Read visible text in the active window when accessibility exposes no text."""
+"""Recognize visible text near the pointer when accessibility exposes no text."""
 
 from dataclasses import dataclass
 import csv
@@ -6,10 +6,14 @@ import io
 import os
 from pathlib import Path
 import shutil
-import struct
 import subprocess
 import tempfile
 import time
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib
 
 from .model import Piece, Rect, passages
 from .speech import Cancelled, reap
@@ -71,7 +75,14 @@ def at_point(words, point):
         if word.line == following.line and box.y - 3 <= y < box.y + box.h + 3:
             if box.x + box.w <= x < following.box.x and following.box.x - x < 15:
                 return words[i + 1:]
-    return []
+    nearest = []
+    for i, word in enumerate(words):
+        box = word.box
+        dx = max(box.x - x, x - (box.x + box.w - 1), 0)
+        dy = max(box.y - y, y - (box.y + box.h - 1), 0)
+        if dx <= 12 and dy <= 8:
+            nearest.append((dx ** 2 + dy ** 2, i))
+    return words[min(nearest)[1]:] if nearest else []
 
 
 def command(argv, cancel, seconds):
@@ -91,11 +102,42 @@ def command(argv, cancel, seconds):
             reap(process)
 
 
+def capture_region(request):
+    active, hovered = request.get("active"), request.get("hovered")
+    if request.get("screen"):
+        screen = Rect(*request["screen"])
+        bounds = screen.intersect(Rect(*hovered["frame"])) if hovered else screen
+        return ["--current"], screen, bounds
+    if active and hovered == active:
+        bounds = Rect(*active["client"])
+        return ["--activewindow", "--no-decoration", "--no-shadow"], bounds, bounds
+    return [], None, None
+
+
+def crop(png, source, bounds):
+    image = GdkPixbuf.Pixbuf.new_from_file(str(png))
+    width, height = image.get_width(), image.get_height()
+    if abs((width / height) / (source.w / source.h) - 1) > 0.06:
+        return None
+    if bounds == source:
+        return width, height
+    x = round((bounds.x - source.x) * width / source.w)
+    y = round((bounds.y - source.y) * height / source.h)
+    right = round((bounds.x + bounds.w - source.x) * width / source.w)
+    bottom = round((bounds.y + bounds.h - source.y) * height / source.h)
+    if right <= x or bottom <= y:
+        return None
+    cropped = image.new_subpixbuf(x, y, right - x, bottom - y)
+    cropped.savev(str(png), "png", [], [])
+    return cropped.get_width(), cropped.get_height()
+
+
 def capture(request, base, cancel):
     if os.environ.get("SELECT_TO_SPEAK_OCR", "1") == "0":
         return None
-    active, hovered = request.get("active"), request.get("hovered")
-    if not active or hovered != active:
+    options, source, bounds = capture_region(request)
+    point = request["point"]
+    if bounds is None or not bounds.contains(*point):
         return None
     spectrum = shutil.which("spectacle")
     tesseract = shutil.which("tesseract")
@@ -104,30 +146,27 @@ def capture(request, base, cancel):
         tesseract = str(local)
     if not spectrum or not tesseract:
         return None
-    bounds = Rect(*active["client"])
-    if not bounds.contains(*request["point"]):
-        return None
-
     with tempfile.TemporaryDirectory(prefix="select-to-speak-", dir=os.environ.get("XDG_RUNTIME_DIR")) as folder:
         png = Path(folder) / "window.png"
-        command([spectrum, "-b", "-n", "-a", "-e", "-S", "-o", str(png)], cancel, 3)
+        command([spectrum, "-b", "-n", *options, "-o", str(png)], cancel, 3)
         deadline = time.monotonic() + 2
         while not png.is_file():
             if cancel.wait(0.06):
                 raise Cancelled
             if time.monotonic() >= deadline:
                 return None
-        with png.open("rb") as file:
-            header = file.read(24)
-        if len(header) != 24 or not header.startswith(b"\x89PNG\r\n\x1a\n"):
+        try:
+            size = crop(png, source, bounds)
+        except GLib.Error:
             return None
-        width, height = struct.unpack("!II", header[16:24])
-        if not width or not height or abs((width / height) / (bounds.w / bounds.h) - 1) > 0.06:
+        if size is None:
             return None
         language = os.environ.get("SELECT_TO_SPEAK_OCR_LANGUAGE", "eng")
-        output = command([tesseract, str(png), "stdout", "-l", language, "tsv"], cancel, 10)
-        if not output:
-            return None
-        words = at_point(parse(output.decode("utf-8", errors="replace"), (width, height), bounds),
-                         request["point"])
-        return ImageReading(words) if words else None
+        for layout in ("3", "11"):
+            output = command([tesseract, str(png), "stdout", "-l", language,
+                              "--psm", layout, "tsv"], cancel, 10)
+            if output:
+                words = at_point(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
+                if words:
+                    return ImageReading(words)
+        return None

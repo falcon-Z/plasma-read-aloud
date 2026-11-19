@@ -2,7 +2,7 @@
 
 Select to Speak reads on demand in Plasma 6 on Wayland. It runs in your user session and uses an offline Piper voice. A click-through amber highlight follows the sentence being spoken.
 
-Press **Alt+Esc** to read the selection in the active app. Without a selection, reading starts at the caret in a focused editor or at the word under the pointer. Press **Alt+Esc** again or tap and release **Ctrl** by itself to stop. Ctrl combinations such as **Ctrl+C** still go to the app.
+Point at text, a control, a menu item, a desktop panel, or a pop-up and press **Alt+Esc**. The reader speaks the accessible text or name at that spot, including names for icons in the Plasma system tray and task manager. While pointing inside the active window, a text selection takes priority. Pointing inside a focused editor starts at its caret when no text is selected. Press **Alt+Esc** again or tap and release **Ctrl** by itself to stop. Ctrl combinations such as **Ctrl+C** still go to the app.
 
 Click the headphones icon in the Plasma system tray to change speech rate or stop playback. The default is **1.20×**. The slider moves in **0.05×** steps between **0.50×** and **2.00×**. Changes are saved automatically and take effect at the next sentence.
 
@@ -28,7 +28,7 @@ Running `./install` uses an existing Piper environment if present, with eSpeak N
 
 Chromium-based browsers publish page accessibility on demand. The reader requests the native accessibility tree when you invoke it. [Chromium accessibility overview](https://chromium.googlesource.com/chromium/src/+/main/docs/accessibility/overview.md)
 
-For OCR in image-only apps and scanned pages, install Spectacle, Tesseract, and a Tesseract language pack. Point to a visible word in the active window. OCR reads the visible window image in the order detected by Tesseract. Selection, offscreen text, and semantic web structure depend on the app’s accessibility data. Screenshots used for OCR are temporary.
+If an app exposes no readable accessibility data at the pointer, the reader can use OCR on the visible window, menu, or pop-up under it. Install Spectacle, Tesseract, and a Tesseract language pack, then point at or near visible text. Selection, offscreen text, and names for icons without visible labels depend on the app’s accessibility data. Screenshots used for OCR are temporary.
 
 ```sh
 sudo dnf install spectacle tesseract tesseract-langpack-eng

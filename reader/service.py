@@ -101,8 +101,8 @@ class Reader:
                 "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications", "Notify",
                 GLib.Variant("(susssasa{sv}i)", (
-                    "Select to Speak", 0, "text-to-speech", "No readable text here",
-                    "Select some text or point at a word and try again.", [],
+                    "Select to Speak", 0, "text-to-speech", "Nothing readable here",
+                    "Point at text or a control, or select some text and try again.", [],
                     {"transient": GLib.Variant("b", True)}, 2500,
                 )), None, Gio.DBusCallFlags.NONE, 750, None, None, None,
             )
@@ -140,7 +140,7 @@ class Reader:
                 following = next(remaining, None)
                 if following is not None:
                     self.voice.queue(following.text, queued_rate)
-                boxes = reading.rectangles(current, scroll=reading.mode != "visible image")
+                boxes = reading.rectangles(current, scroll=reading.mode in {"selection", "caret", "pointer"})
                 check()
                 previous_boxes = None
 
@@ -203,6 +203,11 @@ def validate(request):
 
     if not isinstance(request, dict) or not integers(request.get("point"), 2):
         raise ValueError
+    screen = request.get("screen")
+    if screen is not None and (not integers(screen, 4) or min(screen[2:]) <= 0):
+        raise ValueError
+    if "pointerOnly" in request and type(request["pointerOnly"]) is not bool:
+        raise ValueError
     for key in ("active", "hovered"):
         item = request.get(key)
         if item is not None:
@@ -211,6 +216,8 @@ def validate(request):
             if not all(integers(item.get(rect), 4) for rect in ("client", "frame")):
                 raise ValueError
             if "buffer" in item and not integers(item["buffer"], 4):
+                raise ValueError
+            if "popup" in item and type(item["popup"]) is not bool:
                 raise ValueError
 
 

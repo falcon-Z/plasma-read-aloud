@@ -1,0 +1,12 @@
+{
+  "KPlugin": {
+    "Id": "select-to-speak",
+    "Name": "Select to Speak",
+    "Description": "Read selected text or start reading at the pointer",
+    "Version": "2.1",
+    "License": "GPL-3.0-or-later"
+  },
+  "KPackageStructure": "KWin/Script",
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js"
+}

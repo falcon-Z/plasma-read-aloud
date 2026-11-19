@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "$(realpath -- "$0")")"
+data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+runtime="$data_home/select-to-speak/runtime/gtk/usr/lib64"
+if [[ -f "$runtime/libgtk4-layer-shell.so.0" ]]; then
+    export GI_TYPELIB_PATH="$runtime/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+    export LD_PRELOAD="$runtime/libgtk4-layer-shell.so.0${LD_PRELOAD:+:$LD_PRELOAD}"
+else
+    export LD_PRELOAD="libgtk4-layer-shell.so.0${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+export GDK_BACKEND=wayland
+exec /usr/bin/python3 -m reader.service "$@"

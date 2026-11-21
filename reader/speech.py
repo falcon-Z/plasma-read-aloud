@@ -118,6 +118,8 @@ class Voice:
         if self.use_piper:
             try:
                 size, = struct.unpack("!I", self._read(4, cancel))
+                if size == 0:
+                    return b""
                 if not 44 < size <= 20_000_000:
                     raise OSError("Invalid audio from Piper")
                 return self._read(size, cancel)

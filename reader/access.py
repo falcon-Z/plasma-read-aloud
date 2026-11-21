@@ -392,7 +392,7 @@ class Flow:
                 for child in descendants:
                     if self.visible_only and self.pieces:
                         self.pieces.append(Piece("\n"))
-                    self.append(child)
+                    self.descend(child, selected)
             elif kind in LABELS:
                 name = attempt(node.get_name, default="")
                 if name:
@@ -409,16 +409,23 @@ class Flow:
                 self.pieces.append(Piece(value[cursor:index], node, cursor))
             child = embedded_child(node, index)
             if child is not None:
-                ranges = list(selections(child)) if selected and role(child) != ROLE.PASSWORD_TEXT else []
-                if ranges:
-                    for low, high in ranges:
-                        self.seen.discard(child)
-                        self.append(child, low, high, selected=True)
-                else:
-                    self.append(child)
+                self.descend(child, selected)
             cursor = index + 1
         if cursor < end:
             self.pieces.append(Piece(value[cursor:end], node, cursor))
+
+    def descend(self, child, selected):
+        # Chromium includes embedded fields in the document's selection
+        # offsets, even though their values are not part of the selected page.
+        if selected and (role(child) == ROLE.PASSWORD_TEXT or editable(child)):
+            return
+        ranges = list(selections(child)) if selected else []
+        if ranges:
+            for low, high in ranges:
+                self.seen.discard(child)
+                self.append(child, low, high, selected=True)
+        else:
+            self.append(child, selected=selected)
 
     def from_node(self, node, offset, scope):
         self.append(node, offset)
@@ -554,7 +561,7 @@ def resolve(request, check):
     point = request["point"]
     active_window, hovered_window = request.get("active"), request.get("hovered")
     same_window = active_window == hovered_window
-    use_active = not request.get("pointerOnly") and same_window
+    use_active = active_window is not None and not request.get("pointerOnly")
     active = surface_for(active_window, check) if use_active else None
     focus = focus_in(active, check)
     if active:

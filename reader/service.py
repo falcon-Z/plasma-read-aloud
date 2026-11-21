@@ -18,9 +18,11 @@ from .speech import Cancelled, Voice
 NAME = "org.kde.SelectToSpeak"
 PATH = "/SelectToSpeak"
 LOG = logging.getLogger("select-to-speak")
+STOP_ACTION = ("kwin", "Select to Speak: Stop reading", "KWin", "Select to Speak: Stop reading")
+QT_ESCAPE = 0x01000000
 EMPTY = ("No readable text found at the pointer", "Point at text or a control, or select some text and try again.")
 PROTECTED = ("This field is protected", "Protected text can't be read aloud.")
-FAILED = ("Couldn't read aloud", "Press Alt+Esc to try again.")
+FAILED = ("Couldn't read aloud", "Use the read-aloud shortcut to try again.")
 INTERFACE = f"""
 <node>
   <interface name="{NAME}">
@@ -39,15 +41,17 @@ INTERFACE = f"""
 
 
 class Reader:
-    def __init__(self, base, settings):
+    def __init__(self, base, settings, bus):
         from .overlay import Highlight
 
         self.base = base
         self.settings = settings
+        self.bus = bus
         self.rate = load_rate(settings)
         self.highlight = Highlight()
         self.voice = Voice(base)
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.access_context = GLib.MainContext.new()
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, initializer=self.init_access)
         self.cues = (concurrent.futures.ThreadPoolExecutor(max_workers=1)
                      if os.environ.get("SELECT_TO_SPEAK_AUDIO_CUES", "1") != "0" else None)
         self.job = None
@@ -57,6 +61,13 @@ class Reader:
         self.tray = None
         self.pool.submit(self.voice.warm)
         self.locked = False
+
+    def init_access(self):
+        # Keep AT-SPI's bus watches on the same worker as its synchronous
+        # calls so the GTK main loop cannot dispatch their replies in parallel.
+        access.A.init()
+        access.A.set_main_context(self.access_context)
+        access.A.set_timeout(800, 1000)
 
     def attach_tray(self, bus):
         from .tray import Tray
@@ -71,22 +82,40 @@ class Reader:
         self.rate = rate
         self.tray.update(self.phase, self.rate)
 
+    def set_escape(self, enabled):
+        keys = [([QT_ESCAPE],)] if enabled else []
+        try:
+            self.bus.call_sync(
+                "org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel",
+                "setForeignShortcutKeys", GLib.Variant("(asa(ai))", (STOP_ACTION, keys)),
+                None, Gio.DBusCallFlags.NO_AUTO_START, 500, None,
+            )
+        except GLib.Error as exc:
+            LOG.warning("Could not %s the Escape shortcut: %s", "bind" if enabled else "release", exc.message)
+
     def start(self, request):
         if self.locked:
             return
-        self.stop()
+        idle = self.job is None
+        self.cancel_current()
         cancel = self.job = threading.Event()
-        self.update(cancel, "finding text")
+        if idle:
+            self.set_escape(True)
+        self.update(cancel, "finding text", [])
         self.cue("accepted", cancel)
         self.task = self.pool.submit(self.run, request, cancel)
 
-    def stop(self):
+    def cancel_current(self):
         if self.feedback_job is not None:
             self.feedback_job.set()
             self.feedback_job = None
         if self.job is not None:
             self.job.set()
             self.task.cancel()
+
+    def stop(self):
+        self.cancel_current()
+        if self.job is not None:
             self.update(self.job, "idle", [])
 
     def update(self, cancel, phase, boxes=None):
@@ -96,6 +125,7 @@ class Reader:
         if phase == "idle":
             self.job = None
             self.task = None
+            self.set_escape(False)
         if boxes is not None:
             self.highlight.update(boxes)
         self.tray.update(phase, self.rate)
@@ -129,6 +159,8 @@ class Reader:
             GLib.idle_add(self.update, cancel, "speaking", [])
             self.voice.queue(message, rate)
             wav = self.voice.receive(message, rate, cancel)
+            if not wav:
+                return False
             self.voice.play(wav, cancel, lambda: None)
             return True
         except Cancelled:
@@ -161,6 +193,7 @@ class Reader:
         def check():
             if cancel.is_set():
                 raise Cancelled
+            self.access_context.iteration(False)
 
         outcome = None
         audio_pending = False
@@ -204,6 +237,9 @@ class Reader:
                     self.voice.queue(following.text, queued_rate)
                     audio_pending = True
                 check()
+                if not wav:
+                    current = following
+                    continue
                 previous_boxes = None
 
                 def refresh():
@@ -269,7 +305,10 @@ class Reader:
             except (TypeError, KeyError, ValueError):
                 reply.return_dbus_error(NAME + ".InvalidRequest", "Expected KWin point and window data.")
                 return
-            self.start(request)
+            if method == "ReadOrStop" and self.job is not None:
+                self.stop()
+            else:
+                self.start(request)
         reply.return_value(None)
 
 
@@ -313,11 +352,9 @@ def main():
         )
     except GLib.Error as exc:
         LOG.warning("Could not enable desktop accessibility: %s", exc.message)
-    access.A.init()
-    access.A.set_timeout(800, 1000)
     loop = GLib.MainLoop()
     node = Gio.DBusNodeInfo.new_for_xml(INTERFACE)
-    reader = Reader(base, config / "settings.json")
+    reader = Reader(base, config / "settings.json", bus)
     reader.loop = loop
     bus.register_object(PATH, node.interfaces[0], reader.handle, None, None)
     reply = bus.call_sync(
@@ -327,6 +364,7 @@ def main():
     if reply.unpack()[0] != 1:
         reader.close()
         raise RuntimeError(f"{NAME} is already running")
+    reader.set_escape(False)
     reader.attach_tray(bus)
     bus.signal_subscribe("org.freedesktop.ScreenSaver", "org.freedesktop.ScreenSaver",
                          "ActiveChanged", None, None, Gio.DBusSignalFlags.NONE, reader.lock_changed)

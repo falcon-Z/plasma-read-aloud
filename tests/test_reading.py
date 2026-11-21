@@ -35,10 +35,9 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(speech[1].pieces[0].offset, 35)
 
     def test_selection_keeps_text_on_each_side_of_partial_link(self):
-        paragraph, link = object(), object()
+        link = accessible(access.ROLE.LINK, "", Rect(20, 0, 40, 20))
+        paragraph = accessible(access.ROLE.PARAGRAPH, "", Rect(0, 0, 120, 20), link)
         with (
-            patch.object(access, "role", side_effect={paragraph: access.ROLE.PARAGRAPH,
-                                                     link: access.ROLE.LINK}.__getitem__),
             patch.object(access, "text_of", side_effect={paragraph: "Before \ufffc after.",
                                                         link: "whole linked label"}.__getitem__),
             patch.object(access, "embedded_child", return_value=link),
@@ -47,6 +46,43 @@ class ReadingTests(unittest.TestCase):
             flow = access.Flow(lambda: None)
             flow.append(paragraph, 0, 15, selected=True)
         self.assertEqual([u.text for u in passages(flow.pieces)], ["Before linked after."])
+
+    def test_document_selection_skips_embedded_field_values_but_focused_field_can_be_read(self):
+        bounds = Rect(0, 0, 120, 30)
+        field = accessible(access.ROLE.ENTRY, "", bounds)
+        password = accessible(access.ROLE.PASSWORD_TEXT, "", bounds)
+        paragraph = accessible(access.ROLE.PARAGRAPH, "", bounds, field, password)
+        surface = access.Surface(paragraph, bounds, access.SCREEN, 0, 0)
+        values = {paragraph: "Before \ufffc\ufffc after.", field: "Draft value."}
+        selected = {paragraph: [(0, 16)], field: [(0, 12)]}
+        with (
+            patch.object(access, "text_of", side_effect=lambda node: values.get(node, "")),
+            patch.object(access, "embedded_child", side_effect=lambda _, i: (field, password)[i - 7]),
+            patch.object(access, "selections", side_effect=lambda node: iter(selected.get(node, []))),
+        ):
+            document = access.selected_flow(surface, None, lambda: None)
+            focused = access.selected_flow(surface, field, lambda: None)
+        self.assertEqual([u.text for u in passages(document.pieces)], ["Before after."])
+        self.assertEqual([u.text for u in passages(focused.pieces)], ["Draft value."])
+
+    def test_active_selection_wins_outside_the_window_unless_pointer_only(self):
+        bounds = Rect(0, 0, 120, 30)
+        paragraph = accessible(access.ROLE.PARAGRAPH, "", bounds)
+        surface = access.Surface(paragraph, bounds, access.SCREEN, 0, 0)
+        active, hovered = {"pid": 1}, {"pid": 2}
+        check = lambda: None
+        with (
+            patch.object(access, "surface_for", side_effect=lambda window, _: surface if window == active else None),
+            patch.object(access, "text_of", return_value="Skip. First sentence. Second sentence. Skip."),
+            patch.object(access, "selections", return_value=[(6, 38)]),
+        ):
+            for target in (hovered, None):
+                with self.subTest(hovered=target):
+                    request = {"point": [200, 10], "active": active, "hovered": target}
+                    reading = access.resolve(request, check)
+                    self.assertEqual(reading.mode, "selection")
+                    self.assertEqual([u.text for u in reading.utterances()], ["First sentence.", "Second sentence."])
+                    self.assertIsNone(access.resolve(dict(request, pointerOnly=True), check))
 
     def test_pointer_starts_at_whole_word(self):
         self.assertEqual(from_word("Begin at déjà vu.", 12), 9)
@@ -63,11 +99,11 @@ class ReadingTests(unittest.TestCase):
         hovered = {"pid": 2}
         with (
             patch.object(access, "extents", side_effect=lambda node, _: node.bounds),
-            patch.object(access, "surface_for", return_value=surface) as surface_for,
+            patch.object(access, "surface_for", side_effect=[None, surface]) as surface_for,
         ):
             check = lambda: None
             reading = access.resolve({"point": [90, 10], "active": active, "hovered": hovered}, check)
-            surface_for.assert_called_once_with(hovered, check)
+            self.assertEqual([call.args for call in surface_for.call_args_list], [(active, check), (hovered, check)])
             utterance, = reading.utterances()
             self.assertEqual(utterance.text, "ChatGPT")
             self.assertEqual(reading.rectangles(utterance), [area])
@@ -142,7 +178,7 @@ class ReadingTests(unittest.TestCase):
             ocr.Word("read.", Rect(139, 21, 32, 14), (3,), (3, 1)),
             ocr.Word("Pause", Rect(285, 20, 45, 15), (4,), (4, 1)),
         ]
-        reading = ocr.ImageReading(ocr.paragraph_at(words, (66, 24)))
+        reading = ocr.ImageReading(ocr.passage_at(words, (66, 24)))
         utterance, = reading.utterances()
         self.assertEqual(utterance.text, "Alt+Esc to read.")
         self.assertEqual(reading.rectangles(utterance), [Rect(62, 19, 109, 18)])
@@ -173,6 +209,21 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(ocr.at_point(words, (355, 167)), words[1:])
         self.assertEqual(ocr.at_point(words, (300, 150)), [])
         self.assertEqual(words[1].box, Rect(345, 170, 35, 10))
+
+    def test_ocr_continues_across_blocks_in_the_same_column(self):
+        words = [
+            ocr.Word("Skip", Rect(20, 20, 35, 15), (1,), (1, 1)),
+            ocr.Word("this", Rect(62, 20, 30, 15), (1,), (1, 1)),
+            ocr.Word("line.", Rect(20, 43, 35, 15), (3,), (3, 1)),
+            ocr.Word("Sidebar", Rect(285, 43, 70, 15), (2,), (2, 1)),
+            ocr.Word("Second sentence.", Rect(20, 80, 150, 15), (4,), (4, 1)),
+            ocr.Word("After the gap.", Rect(20, 180, 120, 15), (5,), (5, 1)),
+        ]
+        reading = ocr.ImageReading(ocr.passage_at(words, (66, 24)))
+        first, second = reading.utterances()
+        self.assertEqual([first.text, second.text], ["this line.", "Second sentence."])
+        self.assertEqual(reading.rectangles(first), [words[1].box, words[2].box])
+        self.assertEqual(ocr.passage_at(words, (175, 24)), [])
 
     def test_ocr_can_capture_a_non_active_popup_on_a_scaled_monitor(self):
         request = {

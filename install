@@ -57,6 +57,7 @@ StartLimitBurst=3
 
 [Service]
 ExecStart="$base/app/launch"
+ExecStopPost=-/usr/bin/busctl --user --timeout=1s call org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel setForeignShortcutKeys "asa(ai)" 4 kwin "Select to Speak: Stop reading" KWin "Select to Speak: Stop reading" 0
 EnvironmentFile=$config_home/select-to-speak/env
 Restart=on-failure
 RestartSec=2
@@ -70,8 +71,17 @@ gsettings set org.gnome.desktop.interface toolkit-accessibility true
 
 if [[ -d "$data_home/kwin/scripts/select-to-speak" ]]; then
     busctl --user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s select-to-speak >/dev/null
+    read_action='Select to Speak: Read aloud'
+    # Replace the former Meta+Shift+F8 and Ctrl+Shift+Return defaults.
+    case $(busctl --user call org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel \
+        shortcutKeys as 4 kwin "$read_action" KWin "$read_action") in
+        'a(ai) 1 4 318767159 0 0 0'|'a(ai) 1 4 117440516 0 0 0')
+            busctl --user call org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel unregister ss kwin "$read_action" >/dev/null
+            ;;
+    esac
     for old_action in 'Select to Speak: Read or pause' 'Select to Speak: Stop' \
-        'Select to Speak: From pointer' 'Select to Speak: Cancel'; do
+        'Select to Speak: From pointer' 'Select to Speak: Cancel' 'Select to Speak: Read or stop' \
+        'Select to Speak: Read without Alt' 'Select to Speak: Stop with Ctrl'; do
         busctl --user call org.kde.kglobalaccel /kglobalaccel org.kde.KGlobalAccel unregister ss kwin "$old_action" >/dev/null
     done
     kpackagetool6 --type KWin/Script --upgrade kwin

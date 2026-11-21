@@ -3,7 +3,7 @@
 from dataclasses import dataclass, replace
 import csv
 import io
-from itertools import groupby, takewhile
+from itertools import groupby
 import logging
 import os
 from pathlib import Path
@@ -100,39 +100,62 @@ def at_point(words, point):
     return words[min(nearest)[1]:] if nearest else []
 
 
-def paragraph_at(words, point):
+def row_at(words, anchor, reference):
+    # Different fonts can split one visual row across OCR blocks. Keep
+    # nearby words together and stop where the horizontal gap opens a column.
+    neighbors = []
+    for word in words:
+        box = word.box
+        overlap = min(box.y + box.h, reference.y + reference.h) - max(box.y, reference.y)
+        if word == anchor or overlap >= min(box.h, reference.h) / 2:
+            neighbors.append(word)
+    row = []
+    inline_gap = max(14, min(36, reference.h * 2))
+    for word in sorted(neighbors, key=lambda word: word.box.x):
+        if row and word.box.x - (row[-1].box.x + row[-1].box.w) > inline_gap:
+            if anchor in row:
+                return row
+            row = []
+        row.append(word)
+    return row
+
+
+def passage_at(words, point):
     matches = at_point(words, point)
     if not matches:
         return []
-    paragraph = matches[0].paragraph
-    paragraph_words = takewhile(lambda word: word.paragraph == paragraph, matches)
-    result = []
-    previous_row = None
-    for key, group in groupby(paragraph_words, key=lambda word: word.line):
+    anchor = matches[0]
+    lines = {}
+    for key, group in groupby(words, key=lambda word: word.line):
         line = list(group)
-        first = line[0]
-        reference = max(line, key=lambda word: word.box.w).box
-        if previous_row is not None:
-            if reference.y < previous_row.y + previous_row.h / 2:
+        lines[key] = line[0], max(line, key=lambda word: word.box.w).box
+    _, previous = lines[anchor.line]
+    row = row_at(words, anchor, previous)
+    left = row[0].box.x
+    paragraph = anchor.paragraph
+    source_paragraphs = {word.paragraph for word in row}
+    result = [replace(word, paragraph=paragraph, line=anchor.line) for word in row[row.index(anchor):]]
+    for first, reference in sorted(lines.values(), key=lambda line: line[1].y):
+        if reference.y < previous.y + previous.h / 2:
+            continue
+        height = max(reference.h, previous.h)
+        gap = reference.y - (previous.y + previous.h)
+        if gap > max(20, min(48, height * 2)):
+            break
+        next_row = row_at(words, first, reference)
+        next_left = next_row[0].box.x
+        next_paragraphs = {word.paragraph for word in next_row}
+        same_paragraph = bool(source_paragraphs & next_paragraphs)
+        indent = max(14, min(32, height * 1.4))
+        if abs(left - next_left) > indent:
+            next_right = next_row[-1].box.x + next_row[-1].box.w
+            right = row[-1].box.x + row[-1].box.w
+            if not same_paragraph or max(left, next_left) >= min(right, next_right):
                 continue
-            gap = reference.y - (previous_row.y + previous_row.h)
-            if gap > max(12, max(reference.h, previous_row.h) * 1.4):
-                break
-        previous_row = reference
-        # A change of font, such as a bold shortcut, can split one visible
-        # line into multiple OCR blocks. Join only close words on that row.
-        candidates = []
-        for word in words:
-            box = word.box
-            overlap = min(box.y + box.h, reference.y + reference.h) - max(box.y, reference.y)
-            if box.x > first.box.x and overlap >= min(box.h, reference.h) / 2:
-                candidates.append(word)
-        result.append(first)
-        for word in sorted(candidates, key=lambda word: word.box.x):
-            previous = result[-1].box
-            if word.box.x - (previous.x + previous.w) > max(14, min(36, reference.h * 2)):
-                break
-            result.append(replace(word, paragraph=paragraph, line=key))
+        if not same_paragraph and gap > max(12, height * 0.75):
+            paragraph = first.paragraph
+        result.extend(replace(word, paragraph=paragraph, line=first.line) for word in next_row)
+        row, previous, source_paragraphs = next_row, reference, next_paragraphs
     return result
 
 
@@ -259,7 +282,7 @@ def recognize(image, tesseract, language, layout, bounds, point, cancel):
     if not output:
         return []
     size = image.get_width(), image.get_height()
-    return paragraph_at(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
+    return passage_at(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
 
 
 def capture(request, base, cancel):
@@ -276,7 +299,8 @@ def capture(request, base, cancel):
     if not tesseract:
         return None
     _, y = point
-    bounds = bounds.intersect(Rect(bounds.x, y - 120, bounds.w, 480))
+    top = max(bounds.y, y - 120)
+    bounds = Rect(bounds.x, top, bounds.w, bounds.y + bounds.h - top)
     image = capture_area(bounds, cancel)
     if image is None:
         image = capture_spectacle(options, source, bounds, cancel)

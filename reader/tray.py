@@ -14,7 +14,7 @@ WATCHER_PATH = "/StatusNotifierWatcher"
 DISPLAY_NAME = "Select to Speak"
 ICON = "audio-headphones-symbolic"
 STATUS_TEXT = {
-    "idle": "Alt+Esc to read",
+    "idle": "Ctrl+Esc to read",
     "finding text": "Finding text…",
     "recognizing text": "Recognizing text…",
     "preparing audio": "Preparing audio…",
@@ -127,7 +127,7 @@ class Tray:
         panel.append(Gtk.Separator())
         footer = Gtk.Box(spacing=12)
         panel.append(footer)
-        hint = Gtk.Label(label="Alt+Esc to read\nTap Ctrl to stop", xalign=0, hexpand=True)
+        hint = Gtk.Label(label=f'{STATUS_TEXT["idle"]}\nEsc to stop', xalign=0, hexpand=True)
         hint.add_css_class("dim-label")
         hint.add_css_class("caption")
         footer.append(hint)

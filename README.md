@@ -2,15 +2,15 @@
 
 Select to Speak reads on demand in Plasma 6 on Wayland. It runs in your user session and uses an offline Piper voice. A click-through amber highlight follows the sentence being spoken.
 
-Point at text, a control, a menu item, or a pop-up and press **Alt+Esc**. A short rising tone confirms the reader received the shortcut. If text lookup fails, the reader says “No readable text found at the pointer.” A lower, falling tone provides feedback if the status message itself cannot play. The tray tooltip also shows the current status.
+Point at text, a control, a menu item, or a pop-up and press **Ctrl+Esc**. A short rising tone confirms the reader received the shortcut. If text lookup fails, the reader says “No readable text found at the pointer.” A lower, falling tone provides feedback if the status message itself cannot play. The tray tooltip also shows the current status.
 
-The reader speaks the accessible text or name at that spot, including names for icons in the Plasma system tray and task manager. While pointing inside the active window, a text selection takes priority. Pointing inside a focused editor starts at its caret when no text is selected. Each **Alt+Esc** press starts a fresh request at the current pointer position and replaces any request in progress. Tap and release **Ctrl** by itself to stop at any stage. Ctrl combinations such as **Ctrl+C** still go to the app.
+The reader checks for selected text in the active window first, even if the pointer has moved away. With no selection, it speaks the accessible text or name at the pointer, including names for icons in the Plasma system tray and task manager. Pointing inside a focused editor starts at its caret when no text is selected. Press **Ctrl+Esc** again or press **Esc** to stop at any stage. While the reader is idle, Esc goes to the app.
 
 Click the headphones icon in the Plasma system tray to change speech rate or stop playback. The default is **1.20×**. The slider moves in **0.05×** steps between **0.50×** and **2.00×**. Changes are saved automatically and take effect at the next sentence.
 
 On a web page, pointing at ordinary text reads from that word to the end of the article or the enclosing reading region. Prose reading skips nearby playback controls and input fields. Point directly at a control to hear its label. Pointing at a link starts with its full label and continues through its enclosing paragraph, list item, or similar container. Pointer reading can follow the text by scrolling the active window when the app supports accessibility scrolling. In an editor, caret reading begins at the exact insertion point and leaves the viewport in your control.
 
-Shortcut assignments live under **System Settings → Keyboard → Shortcuts → KWin**. [KWin scripting API](https://develop.kde.org/docs/plasma/kwin/api/), [Apple Read & Speak](https://support.apple.com/en-gb/guide/mac-help/mh27448/27/mac/27)
+Change **Select to Speak: Read aloud** under **System Settings → Keyboard → Shortcuts → KWin**. [KWin scripting API](https://develop.kde.org/docs/plasma/kwin/api/), [Apple Read & Speak](https://support.apple.com/en-gb/guide/mac-help/mh27448/27/mac/27)
 
 ## Install
 
@@ -28,9 +28,9 @@ Run the installer from a Plasma Wayland session. Python 3.14 is used only for th
 
 Running `./install` uses an existing Piper environment if present, with eSpeak NG available as a fallback. The installer enables desktop accessibility, loads the KWin script, and starts the user service. An app opened before accessibility was enabled may need to be reopened.
 
-Chromium-based browsers publish page accessibility on demand. The reader requests the native accessibility tree when you invoke it. [Chromium accessibility overview](https://chromium.googlesource.com/chromium/src/+/main/docs/accessibility/overview.md)
+Chromium-based browsers and Electron apps such as ChatGPT desktop can publish page accessibility on demand. The reader requests the native accessibility tree when you invoke it. If ChatGPT desktop was already running when accessibility was enabled, fully quit and reopen it once so its new process can register. [Chromium accessibility overview](https://chromium.googlesource.com/chromium/src/+/main/docs/accessibility/overview.md)
 
-If an app exposes no readable accessibility data at the pointer, the reader can use OCR on the visible window, menu, or pop-up under it. Install Tesseract and a language pack, then point at or near visible text. OCR reads from that word through its recognized paragraph. The highlight uses the positions in the captured image. The reader captures directly through KWin where available and uses a background Spectacle capture otherwise. Selection, offscreen text, and names for icons without visible labels depend on the app’s accessibility data. Screenshots used for OCR are temporary.
+If an app exposes no readable accessibility data at the pointer, the reader can use OCR on the visible window, menu, or pop-up under it. Install Tesseract and a language pack, then point at or near visible text. OCR reads from that word through nearby lines in the same column, including across breaks in Tesseract's layout. The highlight uses the positions in the captured image. The reader captures directly through KWin where available and uses a background Spectacle capture otherwise. Selection, offscreen text, and names for icons without visible labels depend on the app’s accessibility data. Screenshots used for OCR are temporary.
 
 ```sh
 sudo dnf install spectacle tesseract tesseract-langpack-eng

@@ -88,6 +88,51 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(from_word("Begin at déjà vu.", 12), 9)
         self.assertEqual(from_word("first\nsecond", 10), 6)
 
+    def test_focus_reads_a_control_without_using_a_selection_or_pointer_elsewhere(self):
+        area = Rect(0, 0, 120, 30)
+        paragraph = accessible(access.ROLE.PARAGRAPH, "Old selection", area)
+        button = accessible(access.ROLE.PUSH_BUTTON, "Save changes", area)
+        button.get_state_set.return_value.contains.side_effect = (
+            lambda state: state in {access.STATE.SHOWING, access.STATE.FOCUSED}
+        )
+        window = accessible(access.ROLE.FRAME, "", area, paragraph, button)
+        surface = access.Surface(window, area, access.SCREEN, 0, 0)
+        with (
+            patch.object(access, "surface_for", return_value=surface) as locate,
+            patch.object(access, "selections") as selections,
+        ):
+            request = {"target": "focus", "active": {"pid": 1}, "hovered": {"pid": 2}}
+            reading = access.resolve(request, lambda: None)
+            self.assertEqual([u.text for u in reading.utterances()], ["Save changes"])
+            self.assertEqual(locate.call_args.args[0], request["active"])
+            locate.assert_called_once()
+            selections.assert_not_called()
+
+    def test_focus_uses_the_selection_or_caret_in_the_focused_editor(self):
+        area = Rect(0, 0, 120, 60)
+        editor = accessible(access.ROLE.ENTRY, "Editor", area)
+        surface = access.Surface(editor, area, access.SCREEN, 0, 0)
+        value = "First line.\nSecond line."
+        with (
+            patch.object(access, "text_of", return_value=value),
+            patch.object(access, "selections", side_effect=[[(0, 11)], [], []]),
+            patch.object(access.A.Text, "get_caret_offset", side_effect=[12, len(value)]),
+        ):
+            for expected in ("First line.", "Second line.", "Second line."):
+                reading = access.focused_reading(surface, editor, lambda: None)
+                self.assertEqual([u.text for u in reading.utterances()], [expected])
+
+    def test_focus_refuses_to_read_a_protected_field(self):
+        area = Rect(0, 0, 120, 30)
+        field = accessible(access.ROLE.PASSWORD_TEXT, "Password", area)
+        field.get_state_set.return_value.contains.side_effect = (
+            lambda state: state in {access.STATE.SHOWING, access.STATE.FOCUSED}
+        )
+        surface = access.Surface(field, area, access.SCREEN, 0, 0)
+        self.assertIs(access.focus_in(surface, lambda: None), field)
+        with self.assertRaises(access.ProtectedText):
+            access.focused_reading(surface, field, lambda: None)
+
     def test_tray_control_can_be_read_through_an_unnamed_overlay(self):
         area = Rect(80, 0, 20, 20)
         badge = accessible(access.ROLE.LABEL, "1", area)

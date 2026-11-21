@@ -1,16 +1,23 @@
 # Plasma Read Aloud
 
-Select to Speak reads on demand in Plasma 6.4 or later on Wayland. It runs in your user session and uses offline Piper voices. A click-through amber highlight follows the sentence being spoken.
+Select to Speak reads aloud on demand alongside Plasma's Zoom effect. It runs in Plasma 6.4 or later on Wayland and uses offline Piper voices. A click-through highlight marks the text being spoken.
 
-Point at text, a control, a menu item, or a pop-up and press **Ctrl+Esc**. A short rising tone confirms the reader received the shortcut. If text lookup fails, the reader says “No readable text found at the pointer.” A lower, falling tone provides feedback if the status message itself cannot play. The tray tooltip also shows the current status.
+| Default shortcut | Action |
+| --- | --- |
+| **Ctrl+Alt+R** | Read under the pointer. Invoke it again to read from a new spot. |
+| **Ctrl+Alt+Enter** | Read the focused control, text field, or document. |
+| **Ctrl+Esc** | Read the active selection, or read under the pointer if there is no selection. Press it again to stop. |
+| **Ctrl+Alt+Space** | Pause or resume from the start of the current sentence. |
+| **Ctrl+Alt+H / K** | Go to the previous or next sentence. |
+| **Tap Ctrl** | Stop reading, including while looking up text, paused, or previewing a voice. The shortcut fires when you release Ctrl by itself. |
 
-The reader checks for selected text in the active window first, even if the pointer has moved away. With no selection, it speaks the accessible text or name at the pointer, including names for icons in the Plasma system tray and task manager. Pointing inside a focused editor starts at its caret when no text is selected. Press **Ctrl+Esc** again or press **Esc** to stop at any stage. While the reader is idle, Esc goes to the app.
+The pointer command reads where you point, even with text selected elsewhere. Point at a word to start reading there, or at a control, menu item, pop-up, or tray icon to hear its label. On web pages, reading can continue through the article or enclosing reading region. At a link it starts with the full link label. In a focused editor, **Ctrl+Alt+Enter** reads the selection or starts at the caret. At the end of the editor it reads the last nonempty line. Protected fields are skipped.
 
-Click the speech bubble icon in the Plasma system tray to open the Select to Speak widget. Pick a voice and click **Preview** to hear a sample at the current speech rate. Click **Use voice** to save your choice for the next reading. The widget also lets you stop playback or adjust the speech rate from **0.50×** to **2.00×** in **0.05×** steps. The default is **1.20×**, and rate changes take effect at the next sentence.
+Reading keeps the app's scroll position under your control by default. If you want pointer reading to bring offscreen sentences into view, enable auto-scroll below.
 
-On a web page, pointing at ordinary text reads from that word to the end of the article or the enclosing reading region. Prose reading skips nearby playback controls and input fields. Point directly at a control to hear its label. Pointing at a link starts with its full label and continues through its enclosing paragraph, list item, or similar container. Pointer reading can follow the text by scrolling the active window when the app supports accessibility scrolling. In an editor, caret reading begins at the exact insertion point and leaves the viewport in your control.
+Open the speech bubble in the Plasma system tray for playback controls, reading status, voices, and speech rate. **Preview** plays a sample at the current rate. **Use voice** saves your choice for the next reading. The default rate is **1.20×**, and rate changes take effect at the next sentence. A short rising tone confirms a read request. When the target is unavailable, the reader gives spoken feedback and shows the reason in the tray.
 
-Change **Select to Speak: Read aloud** under **System Settings → Keyboard → Shortcuts → KWin**. [KWin scripting API](https://develop.kde.org/docs/plasma/kwin/api/), [Apple Read & Speak](https://support.apple.com/en-gb/guide/mac-help/mh27448/27/mac/27)
+Customize the **Select to Speak** actions under **System Settings → Keyboard → Shortcuts → KWin**. [Apple Read & Speak](https://support.apple.com/en-gb/guide/mac-help/mh27448/27/mac/27), [Windows Magnifier reading](https://support.microsoft.com/en-us/accessibility/windows/magnifier/how-to-use-magnifier-reading)
 
 ## Install
 
@@ -32,7 +39,7 @@ To add more [Piper voices](https://github.com/OHF-Voice/piper1-gpl/blob/main/doc
 
 Chromium-based browsers and Electron apps such as ChatGPT desktop can publish page accessibility on demand. The reader requests the native accessibility tree when you invoke it. If ChatGPT desktop was already running when accessibility was enabled, fully quit and reopen it once so its new process can register. [Chromium accessibility overview](https://chromium.googlesource.com/chromium/src/+/main/docs/accessibility/overview.md)
 
-If an app exposes no readable accessibility data at the pointer, the reader can use OCR on the visible window, menu, or pop-up under it. Install Tesseract and a language pack, then point at or near visible text. OCR reads from that word through nearby lines in the same column, including across breaks in Tesseract's layout. The highlight uses the positions in the captured image. The reader captures directly through KWin where available and uses a background Spectacle capture otherwise. Selection, offscreen text, and names for icons without visible labels depend on the app’s accessibility data. Screenshots used for OCR are temporary.
+If an app exposes no readable accessibility data at the pointer, the reader can use OCR on the visible window, menu, or pop-up under it. Install Tesseract and a language pack, then point at or near visible text. OCR reads from that word through nearby lines in the same column, and the highlight uses the positions in the captured image. The reader captures directly through KWin where available and uses a background Spectacle capture otherwise. Keyboard focus, selection, offscreen text, and names for icons without visible labels depend on the app’s accessibility data. Screenshots used for OCR are temporary.
 
 ```sh
 sudo dnf install spectacle tesseract tesseract-langpack-eng
@@ -48,6 +55,7 @@ Set variables in `~/.config/select-to-speak/env` and restart the service with `s
 | `SELECT_TO_SPEAK_VOICE` | Lessac medium | Path to a Piper ONNX voice with its matching JSON file. Sets the initial choice until a voice is saved from the widget. |
 | `SELECT_TO_SPEAK_PIPER` | Installed Piper Python | Python executable with the Piper package installed. |
 | `SELECT_TO_SPEAK_AUDIO_CUES` | `1` | Set to `0` to turn off the shortcut feedback sounds. |
+| `SELECT_TO_SPEAK_AUTO_SCROLL` | `0` | Set to `1` to scroll to offscreen sentences during pointer reading in the active window, when the app supports accessibility scrolling. |
 | `SELECT_TO_SPEAK_OCR` | `1` | Set to `0` to disable image recognition. |
 | `SELECT_TO_SPEAK_OCR_LANGUAGE` | `eng` | Tesseract language code. |
 

@@ -7,20 +7,19 @@ import os
 from pathlib import Path
 import signal
 import subprocess
-import threading
 
 from gi.repository import Gio, GLib, GLibUnix
 
 from . import access, ocr
+from .playback import ReadingJob
 from .settings import load_rate, load_settings, normalize_rate, save_rate, save_settings
 from .speech import Cancelled, Voice, discover_voices
 
 NAME = "org.kde.SelectToSpeak"
 PATH = "/SelectToSpeak"
 LOG = logging.getLogger("select-to-speak")
-STOP_ACTION = ("kwin", "Select to Speak: Stop reading", "KWin", "Select to Speak: Stop reading")
-QT_ESCAPE = 0x01000000
 EMPTY = ("No readable text found at the pointer", "Point at text or a control, or select some text and try again.")
+EMPTY_FOCUS = ("No readable text at keyboard focus", "Focus a control or text field, or use Read from pointer.")
 PROTECTED = ("This field is protected", "Protected text can't be read aloud.")
 FAILED = ("Couldn't read aloud", "Use the read-aloud shortcut to try again.")
 PREVIEW_TEXT = "Hello! This is how I sound when I read aloud. The quick brown fox jumps over the lazy dog."
@@ -30,6 +29,9 @@ INTERFACE = f"""
     <method name="Read"><arg direction="in" type="s"/></method>
     <method name="ReadOrStop"><arg direction="in" type="s"/></method>
     <method name="Stop"/>
+    <method name="TogglePause"/>
+    <method name="PreviousSentence"/>
+    <method name="NextSentence"/>
     <method name="GetRate"><arg name="rate" direction="out" type="d"/></method>
     <method name="SetRate"><arg name="rate" direction="in" type="d"/></method>
     <method name="SetVoice"><arg name="voice" direction="in" type="s"/></method>
@@ -43,6 +45,9 @@ INTERFACE = f"""
     <property name="Voices" type="s" access="read"/>
     <property name="VoiceId" type="s" access="read"/>
     <property name="PreviewError" type="s" access="read"/>
+    <property name="ReadingError" type="s" access="read"/>
+    <property name="CanGoBack" type="b" access="read"/>
+    <property name="CanGoForward" type="b" access="read"/>
   </interface>
 </node>
 """
@@ -67,6 +72,8 @@ class Reader:
         self.voice_options = json.dumps([{"id": name, "label": option.label}
                                          for name, option in self.voices.items()])
         self.preview_error = ""
+        self.reading_error = ""
+        self.navigation = (False, False)
         self.access_context = GLib.MainContext.new()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, initializer=self.init_access)
         self.cues = (concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -88,11 +95,15 @@ class Reader:
     def get_property(self, bus, sender, path, interface, name):
         if name == "Rate":
             return GLib.Variant("d", self.rate)
+        if name in ("CanGoBack", "CanGoForward"):
+            back, forward = self.navigation
+            return GLib.Variant("b", back if name == "CanGoBack" else forward)
         return GLib.Variant("s", {
             "Phase": self.phase,
             "Voices": self.voice_options,
             "VoiceId": self.voice_id,
             "PreviewError": self.preview_error,
+            "ReadingError": self.reading_error,
         }[name])
 
     def publish(self, **changes):
@@ -122,20 +133,15 @@ class Reader:
             self.preview_error = message
             self.publish(PreviewError=GLib.Variant("s", message))
 
-    def set_escape(self, enabled):
-        keys = [([QT_ESCAPE],)] if enabled else []
-        try:
-            self.bus.call_sync(
-                "org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel",
-                "setForeignShortcutKeys", GLib.Variant("(asa(ai))", (STOP_ACTION, keys)),
-                None, Gio.DBusCallFlags.NO_AUTO_START, 500, None,
-            )
-        except GLib.Error as exc:
-            LOG.warning("Could not %s the Escape shortcut: %s", "bind" if enabled else "release", exc.message)
+    def set_reading_error(self, message):
+        if self.reading_error != message:
+            self.reading_error = message
+            self.publish(ReadingError=GLib.Variant("s", message))
 
     def start(self, request):
         if self.locked:
             return
+        self.set_reading_error("")
         cancel = self.begin("finding text")
         self.cue("accepted", cancel)
         self.task = self.pool.submit(self.run, request, cancel)
@@ -150,11 +156,8 @@ class Reader:
         self.task = self.pool.submit(self.run_preview, self.voices[voice_id].model, cancel)
 
     def begin(self, phase):
-        idle = self.job is None
         self.cancel_current()
-        cancel = self.job = threading.Event()
-        if idle:
-            self.set_escape(True)
+        cancel = self.job = ReadingJob()
         self.update(cancel, phase, [])
         return cancel
 
@@ -163,7 +166,7 @@ class Reader:
             self.feedback_job.set()
             self.feedback_job = None
         if self.job is not None:
-            self.job.set()
+            self.job.stop()
             self.task.cancel()
 
     def stop(self):
@@ -171,16 +174,37 @@ class Reader:
         if self.job is not None:
             self.update(self.job, "idle", [])
 
+    def toggle_pause(self):
+        job = self.job
+        if job is not None and job.toggle_pause():
+            self.update(job, "paused" if job.paused else "preparing audio")
+
+    def seek(self, delta):
+        job = self.job
+        if job is not None and job.seek(delta):
+            self.update(job, "paused" if job.paused else "preparing audio", [])
+
+    def show_sentence(self, job, interrupted, boxes=None):
+        if not interrupted.is_set():
+            self.update(job, "speaking", boxes)
+
     def update(self, cancel, phase, boxes=None):
         if self.job is not cancel:
             return
+        changes = {}
         if self.phase != phase:
             self.phase = phase
-            self.publish(Phase=GLib.Variant("s", phase))
+            changes["Phase"] = GLib.Variant("s", phase)
         if phase == "idle":
             self.job = None
             self.task = None
-            self.set_escape(False)
+        navigation = cancel.navigation() if phase in ("speaking", "paused", "preparing audio") else (False, False)
+        if self.navigation != navigation:
+            self.navigation = navigation
+            changes["CanGoBack"] = GLib.Variant("b", navigation[0])
+            changes["CanGoForward"] = GLib.Variant("b", navigation[1])
+        if changes:
+            self.publish(**changes)
         if boxes is not None:
             self.highlight.update(boxes)
 
@@ -230,6 +254,7 @@ class Reader:
             return
         self.update(cancel, "idle", [])
         if outcome is not None:
+            self.set_reading_error(outcome[0])
             if not spoken:
                 self.cue("unavailable", cancel)
             self.notify(*outcome)
@@ -239,7 +264,7 @@ class Reader:
             return False
         rate = self.rate
         try:
-            GLib.idle_add(self.update, cancel, "speaking", [])
+            GLib.idle_add(self.update, cancel, "announcing status", [])
             self.voice.queue(message, rate)
             wav = self.voice.receive(message, rate, cancel)
             if not wav:
@@ -279,77 +304,37 @@ class Reader:
             self.access_context.iteration(False)
 
         outcome = None
-        audio_pending = False
         try:
             check()
             self.voice.select(self.voices[self.voice_id].model)
+            target = access.request_target(request)
             reading = access.resolve(request, check)
             check()
-            remaining = iter(reading.utterances()) if reading else iter(())
-            current = next(remaining, None)
-            if current is None:
-                check()
+            sentences = list(reading.utterances()) if reading else []
+            if not sentences and target != "focus":
                 GLib.idle_add(self.update, cancel, "recognizing text")
                 reading = ocr.capture(request, self.base, cancel)
-                remaining = iter(reading.utterances()) if reading else iter(())
-                current = next(remaining, None)
+                sentences = list(reading.utterances()) if reading else []
             check()
-            if current is None:
+            if not sentences:
                 LOG.info("No readable text at the requested target")
-                outcome = EMPTY
+                outcome = EMPTY_FOCUS if target == "focus" else EMPTY
                 return
             LOG.info("Reading from %s using %s", reading.mode, self.voice.name)
-            GLib.idle_add(self.update, cancel, "preparing audio")
-            scroll = request.get("active") == request.get("hovered") and reading.mode == "pointer"
-            highlight = True
-            queued_rate = self.rate
-            self.voice.queue(current.text, queued_rate)
-            audio_pending = True
-            while current is not None:
-                wav = self.voice.receive(current.text, queued_rate, cancel)
-                audio_pending = False
-                check()
-                requested_rate = self.rate
-                if requested_rate != queued_rate:
-                    queued_rate = requested_rate
-                    self.voice.queue(current.text, queued_rate)
-                    audio_pending = True
-                    continue
-                following = next(remaining, None)
-                check()
-                if following is not None:
-                    self.voice.queue(following.text, queued_rate)
-                    audio_pending = True
-                check()
-                if not wav:
-                    current = following
-                    continue
-                previous_boxes = None
-
-                def refresh():
-                    nonlocal highlight, previous_boxes
-                    check()
-                    if not highlight:
-                        return
-                    try:
-                        boxes = reading.rectangles(current, scroll=scroll and previous_boxes is None)
-                    except Exception:
-                        LOG.exception("Could not update the reading highlight")
-                        highlight = False
-                        boxes = []
-                    if previous_boxes != boxes:
-                        GLib.idle_add(self.update, cancel, "speaking", boxes)
-                    previous_boxes = boxes
-
-                GLib.idle_add(self.update, cancel, "speaking")
-                self.voice.play(wav, cancel, refresh)
-                current = following
+            cancel.prepare(len(sentences))
+            GLib.idle_add(self.prepare_audio, cancel)
+            scroll = (
+                os.environ.get("SELECT_TO_SPEAK_AUTO_SCROLL") == "1"
+                and request.get("active") is not None
+                and request["active"] == request.get("hovered")
+                and reading.mode == "pointer"
+            )
+            if not self.play_sentences(reading, sentences, cancel, check, scroll):
+                outcome = FAILED
         except access.ProtectedText:
             outcome = PROTECTED
         except Cancelled:
             LOG.info("Read request cancelled")
-            if audio_pending:
-                self.voice.close()
         except Exception:
             self.voice.close()
             LOG.exception("Reading failed")
@@ -357,6 +342,72 @@ class Reader:
         finally:
             spoken = outcome is not None and self.announce(outcome[0] + ".", cancel)
             GLib.idle_add(self.finish, cancel, outcome, spoken)
+
+    def prepare_audio(self, job):
+        if not job.paused:
+            self.update(job, "preparing audio")
+
+    def play_sentences(self, reading, sentences, job, check, scroll):
+        queued = None
+        cached = None
+        highlight = True
+        played = False
+        try:
+            while (sentence := job.sentence()) is not None:
+                index, interrupted = sentence
+                rate = self.rate
+                current = sentences[index]
+
+                if queued is not None:
+                    queued_index, queued_rate = queued
+                    wav = self.voice.receive(sentences[queued_index].text, queued_rate, job)
+                    if queued == (index, rate):
+                        cached = (index, rate, wav)
+                    queued = None
+                if interrupted.is_set():
+                    continue
+                if cached is None or cached[:2] != (index, rate):
+                    self.voice.queue(current.text, rate)
+                    queued = (index, rate)
+                    wav = self.voice.receive(current.text, rate, job)
+                    queued = None
+                    cached = (index, rate, wav)
+                if interrupted.is_set() or rate != self.rate:
+                    continue
+
+                if index + 1 < len(sentences):
+                    self.voice.queue(sentences[index + 1].text, rate)
+                    queued = (index + 1, rate)
+                if cached[2]:
+                    previous_boxes = None
+
+                    def refresh():
+                        nonlocal highlight, previous_boxes
+                        check()
+                        if not highlight or interrupted.is_set():
+                            return
+                        try:
+                            boxes = reading.rectangles(current, scroll=scroll and previous_boxes is None)
+                        except Exception:
+                            LOG.exception("Could not update the reading highlight")
+                            highlight = False
+                            boxes = []
+                        if previous_boxes != boxes:
+                            GLib.idle_add(self.show_sentence, job, interrupted, boxes)
+                        previous_boxes = boxes
+
+                    GLib.idle_add(self.show_sentence, job, interrupted)
+                    try:
+                        self.voice.play(cached[2], interrupted, refresh)
+                        played = True
+                    except Cancelled:
+                        check()
+                job.complete(interrupted)
+            check()
+            return played
+        finally:
+            if queued is not None:
+                self.voice.close()
 
     def close(self, *_):
         self.stop()
@@ -376,6 +427,10 @@ class Reader:
             return
         if method == "Stop":
             self.stop()
+        elif method == "TogglePause":
+            self.toggle_pause()
+        elif method in ("PreviousSentence", "NextSentence"):
+            self.seek(-1 if method == "PreviousSentence" else 1)
         elif method == "SetRate":
             try:
                 self.change_rate(parameters.unpack()[0])
@@ -394,7 +449,7 @@ class Reader:
                 request = json.loads(parameters.unpack()[0])
                 validate(request)
             except (TypeError, KeyError, ValueError):
-                reply.return_dbus_error(NAME + ".InvalidRequest", "Expected KWin point and window data.")
+                reply.return_dbus_error(NAME + ".InvalidRequest", "Expected a reading target and KWin window data.")
                 return
             if method == "ReadOrStop" and self.job is not None:
                 self.stop()
@@ -407,7 +462,12 @@ def validate(request):
     def integers(values, length):
         return isinstance(values, list) and len(values) == length and all(type(v) is int for v in values)
 
-    if not isinstance(request, dict) or not integers(request.get("point"), 2):
+    if not isinstance(request, dict):
+        raise ValueError
+    target = access.request_target(request)
+    if target not in ("auto", "pointer", "focus"):
+        raise ValueError
+    if (target != "focus" or "point" in request) and not integers(request.get("point"), 2):
         raise ValueError
     for key in ("screen", "desktop"):
         geometry = request.get(key)
@@ -455,7 +515,6 @@ def main():
     if reply.unpack()[0] != 1:
         reader.close()
         raise RuntimeError(f"{NAME} is already running")
-    reader.set_escape(False)
     bus.signal_subscribe("org.freedesktop.ScreenSaver", "org.freedesktop.ScreenSaver",
                          "ActiveChanged", None, None, Gio.DBusSignalFlags.NONE, reader.lock_changed)
     try:

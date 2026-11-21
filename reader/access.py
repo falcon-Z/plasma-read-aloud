@@ -314,18 +314,30 @@ def editable(node):
 
 def visible_nodes(node, check):
     check()
-    if not has(node, STATE.SHOWING) or role(node) == ROLE.PASSWORD_TEXT:
+    if not has(node, STATE.SHOWING):
         return
     yield node
+    if role(node) == ROLE.PASSWORD_TEXT:
+        return
     for child in children(node):
         yield from visible_nodes(child, check)
 
 
-def focus_in(surface, check):
+def focus_in(surface, check, editable_only=False):
     if surface is None:
         return None
-    return next((node for node in visible_nodes(surface.node, check)
-                 if has(node, STATE.FOCUSED) and (editable(node) or text_of(node))), None)
+    focused = None
+    for node in visible_nodes(surface.node, check):
+        if not has(node, STATE.FOCUSED):
+            continue
+        kind = role(node)
+        if kind == ROLE.PASSWORD_TEXT or editable(node):
+            return node
+        if not editable_only and kind not in WINDOW_ROLES:
+            if kind in TEXT_TARGETS:
+                return node
+            focused = node
+    return focused
 
 
 def scope_for(node, link=False):
@@ -464,7 +476,7 @@ def selections(node):
                 yield selected.start_offset, selected.end_offset
 
 
-def selected_flow(surface, focus, check):
+def selected_flow(surface, focus, check, *, focus_only=False):
     flow = Flow(check)
     previous_block = None
 
@@ -478,9 +490,9 @@ def selected_flow(surface, focus, check):
             flow.append(node, start, end, selected=True)
             previous_block = block
 
-    if focus is not None and editable(focus):
+    if focus is not None and role(focus) != ROLE.PASSWORD_TEXT and editable(focus):
         add(focus, selections(focus))
-        if flow.pieces:
+        if flow.pieces or focus_only:
             return flow
 
     def visit(node):
@@ -494,7 +506,9 @@ def selected_flow(surface, focus, check):
             for child in children(node):
                 visit(child)
 
-    if surface is not None:
+    if focus_only:
+        visit(focus)
+    elif surface is not None:
         visit(surface.node)
     return flow
 
@@ -557,22 +571,57 @@ class Reading:
         return boxes
 
 
+def request_target(request):
+    return request.get("target", "pointer" if request.get("pointerOnly") else "auto")
+
+
 def resolve(request, check):
-    point = request["point"]
+    target = request_target(request)
     active_window, hovered_window = request.get("active"), request.get("hovered")
     same_window = active_window == hovered_window
-    use_active = active_window is not None and not request.get("pointerOnly")
-    active = surface_for(active_window, check) if use_active else None
-    focus = focus_in(active, check)
+    active = surface_for(active_window, check) if target != "pointer" and active_window else None
+    if target == "focus":
+        focus = focus_in(active, check)
+        return focused_reading(active, focus, check) if focus is not None else None
+
+    focus = focus_in(active, check, editable_only=True)
     if active:
         selected = selected_flow(active, focus, check)
         if readable(selected.pieces):
             return Reading(active, selected.pieces, "selection")
 
-    hovered = active if use_active and same_window else surface_for(hovered_window, check)
+    hovered = active if active and same_window else surface_for(hovered_window, check)
     if hovered:
-        return pointer_reading(hovered, point, check, focus if same_window else None)
+        return pointer_reading(hovered, request["point"], check, focus if same_window else None)
     return None
+
+
+def focused_reading(surface, node, check):
+    kind = role(node)
+    if kind == ROLE.PASSWORD_TEXT:
+        raise ProtectedText
+    if kind in CONTROLS or kind == ROLE.LINK:
+        return element_reading(surface, node, check)
+
+    selected = selected_flow(surface, node, check, focus_only=True)
+    if readable(selected.pieces):
+        return Reading(surface, selected.pieces, "selection")
+    if editable(node):
+        value = text_of(node)
+        offset = attempt(A.Text.get_caret_offset, node, default=-1) if value else -1
+        if value and 0 <= offset <= len(value):
+            if offset == len(value):
+                offset = value.rfind("\n", 0, len(value.rstrip())) + 1
+            flow = Flow(check)
+            flow.append(node, offset)
+            if readable(flow.pieces):
+                return Reading(surface, flow.pieces, "caret")
+        return element_reading(surface, node, check)
+    if kind in DOCUMENTS:
+        flow = Flow(check, visible_only=True, prose=True)
+        flow.append(node)
+        return Reading(surface, flow.pieces, "focus")
+    return element_reading(surface, node, check)
 
 
 def pointer_reading(surface, point, check, focus=None):

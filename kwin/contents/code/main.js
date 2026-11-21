@@ -21,12 +21,13 @@ function describe(window) {
 
 function windowAt(point) {
     if (typeof workspace.windowAt === "function") {
-        return workspace.windowAt(point, 1)[0] || null;
+        return workspace.windowAt(point, -1).find(window => !window.outline && !window.onScreenDisplay)
+            || null;
     }
     const stacking = workspace.stackingOrder;
     for (let i = stacking.length - 1; i >= 0; --i) {
         const window = stacking[i];
-        if (window.deleted || window.hidden || window.minimized || window.outline
+        if (window.deleted || window.hidden || window.minimized || window.outline || window.onScreenDisplay
             || (window.desktops.length && !window.desktops.includes(workspace.currentDesktop))
             || (window.activities.length && !window.activities.includes(workspace.currentActivity))) {
             continue;
@@ -44,21 +45,37 @@ function send(method, ...args) {
     callDBus(service, path, service, method, ...args);
 }
 
-function readOrStop(action) {
-    action.autoRepeat = false;
+function read(method, target) {
+    const active = workspace.activeWindow;
+    if (target === "focus") {
+        send(method, JSON.stringify({target, active: describe(active)}));
+        return;
+    }
     const point = workspace.cursorPos;
     const screen = workspace.screenAt(point);
-    send("ReadOrStop", JSON.stringify({
+    send(method, JSON.stringify({
+        target,
         point: [Math.round(point.x), Math.round(point.y)],
         screen: screen ? geometry(screen.geometry) : null,
         desktop: geometry(workspace.virtualScreenGeometry),
-        active: describe(workspace.activeWindow),
+        active: describe(active),
         hovered: describe(windowAt(point))
     }));
 }
 
-registerShortcut("Select to Speak: Read aloud", "Select to Speak: Read aloud",
-    "Ctrl+Esc", readOrStop);
-// The reader binds Escape to this action only while a request is active.
-registerShortcut("Select to Speak: Stop reading", "Select to Speak: Stop reading",
-    "", () => send("Stop"));
+function shortcut(label, keys, activated) {
+    const name = "Select to Speak: " + label;
+    registerShortcut(name, name, keys, action => {
+        action.autoRepeat = false;
+        activated();
+    });
+}
+
+shortcut("Read aloud", "Ctrl+Esc", () => read("ReadOrStop", "auto"));
+shortcut("Read from pointer", "Ctrl+Alt+R", () => read("Read", "pointer"));
+shortcut("Read keyboard focus", "Ctrl+Alt+Return", () => read("Read", "focus"));
+shortcut("Pause or resume", "Ctrl+Alt+Space", () => send("TogglePause"));
+shortcut("Previous sentence", "Ctrl+Alt+H", () => send("PreviousSentence"));
+shortcut("Next sentence", "Ctrl+Alt+K", () => send("NextSentence"));
+// KWin triggers modifier-only shortcuts on release after a standalone tap.
+shortcut("Stop playback", "Control", () => send("Stop"));

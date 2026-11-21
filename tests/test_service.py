@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 from reader import service
 from reader.model import Utterance
 from reader.settings import load_settings
-from reader.speech import VoiceOption
+from reader.speech import Cancelled, VoiceOption
 
 
 class ShortcutTests(unittest.TestCase):
@@ -26,13 +26,12 @@ class ShortcutTests(unittest.TestCase):
         self.reader.voices = {"lessac": VoiceOption("Lessac", Path("lessac.onnx")),
                               "alba": VoiceOption("Alba", Path("alba.onnx"))}
         self.reader.preview_error = ""
+        self.reader.reading_error = ""
+        self.reader.navigation = (False, False)
         self.reader.highlight = Mock()
         self.reader.cue = Mock()
         self.reader.notify = Mock()
         self.request = {"point": [10, 10]}
-
-    def escape_bindings(self):
-        return [call.args[4].unpack()[1] for call in self.reader.bus.call_sync.call_args_list]
 
     def test_repeat_replaces_request_in_every_phase(self):
         self.reader.start(self.request)
@@ -54,8 +53,6 @@ class ShortcutTests(unittest.TestCase):
                 self.reader.update(job, "speaking", ["stale highlight"])
                 self.assertEqual(self.reader.phase, "finding text")
 
-        self.assertEqual(self.escape_bindings(), [[([service.QT_ESCAPE],)]])
-
     def test_stop_clears_playback_without_starting_another_request(self):
         self.reader.start(self.request)
         job = self.reader.job
@@ -66,7 +63,6 @@ class ShortcutTests(unittest.TestCase):
         self.assertIsNone(self.reader.job)
         self.assertEqual(self.reader.phase, "idle")
         self.reader.pool.submit.assert_called_once()
-        self.assertEqual(self.escape_bindings(), [[([service.QT_ESCAPE],)], []])
 
     def test_read_shortcut_starts_then_stops_at_the_current_phase(self):
         params = service.GLib.Variant("(s)", ('{"point": [10, 10]}',))
@@ -83,7 +79,6 @@ class ShortcutTests(unittest.TestCase):
         self.assertTrue(job.is_set())
         self.assertEqual(self.reader.phase, "idle")
         self.reader.pool.submit.assert_called_once()
-        self.assertEqual(self.escape_bindings(), [[([service.QT_ESCAPE],)], []])
 
     def test_stopped_request_cannot_report_failure_after_restart(self):
         self.reader.start(self.request)
@@ -95,13 +90,11 @@ class ShortcutTests(unittest.TestCase):
         self.reader.finish(old_job, service.FAILED)
         self.assertIs(self.reader.job, new_job)
         self.reader.notify.assert_not_called()
-        self.assertEqual(self.escape_bindings(), [[([service.QT_ESCAPE],)], [], [([service.QT_ESCAPE],)]])
 
         self.reader.finish(new_job, service.EMPTY)
         self.reader.cue.assert_called_with("unavailable", new_job)
         self.reader.notify.assert_called_once_with(*service.EMPTY)
         self.assertEqual(self.reader.phase, "idle")
-        self.assertEqual(self.escape_bindings()[-1], [])
 
     def test_highlight_failure_does_not_interrupt_playback(self):
         self.reader.start(self.request)
@@ -144,6 +137,56 @@ class ShortcutTests(unittest.TestCase):
         self.reader.voice.play.assert_called_once()
         self.reader.notify.assert_called_once_with(*service.EMPTY)
         self.reader.cue.assert_called_once_with("accepted", cancel)
+        self.assertEqual(self.reader.phase, "idle")
+
+    def test_missing_focus_never_reads_pixels_under_the_pointer(self):
+        request = {"target": "focus"}
+        service.validate(request)
+        self.reader.start(request)
+        self.reader.voice = Mock()
+        with (
+            patch.object(service.access, "resolve", return_value=None),
+            patch.object(service.ocr, "capture") as recognize,
+            patch.object(service.GLib, "idle_add", side_effect=lambda fn, *args: fn(*args)),
+        ):
+            self.reader.run(request, self.reader.job)
+
+        recognize.assert_not_called()
+        self.reader.notify.assert_called_once_with(*service.EMPTY_FOCUS)
+        self.assertEqual(self.reader.reading_error, service.EMPTY_FOCUS[0])
+
+    def test_pause_and_sentence_navigation_interrupt_and_retarget_playback(self):
+        self.reader.start(self.request)
+        voice = self.reader.voice = Mock()
+        voice.receive.side_effect = lambda text, *_: text.encode()
+        reading = Mock(mode="selection")
+        reading.utterances.return_value = map(lambda text: Utterance(text, ()),
+                                            ["First.", "Second.", "Third."])
+        heard = []
+
+        def play(audio, interrupted, _):
+            heard.append(audio)
+            if len(heard) == 1:
+                self.assertEqual(self.reader.navigation, (False, True))
+                self.reader.toggle_pause()
+                self.assertEqual(self.reader.phase, "paused")
+                self.reader.seek(1)
+                self.assertEqual(self.reader.phase, "paused")
+                self.assertEqual(self.reader.navigation, (True, True))
+                self.reader.toggle_pause()
+            elif len(heard) == 2:
+                self.reader.seek(-1)
+            if interrupted.is_set():
+                raise Cancelled
+
+        voice.play.side_effect = play
+        with (
+            patch.object(service.access, "resolve", return_value=reading),
+            patch.object(service.GLib, "idle_add", side_effect=lambda fn, *args: fn(*args)),
+        ):
+            self.reader.run(self.request, self.reader.job)
+
+        self.assertEqual(heard, [b"First.", b"Second.", b"First.", b"Second.", b"Third."])
         self.assertEqual(self.reader.phase, "idle")
 
     def test_selection_plays_every_sentence_without_ocr(self):
@@ -224,7 +267,6 @@ class ShortcutTests(unittest.TestCase):
         voice.close.assert_called_once()
         self.assertEqual(self.reader.voice_id, "lessac")
         self.assertEqual(self.reader.phase, "idle")
-        self.assertEqual(self.escape_bindings(), [[([service.QT_ESCAPE],)], []])
 
     def test_saved_voice_and_rate_preserve_each_other(self):
         with TemporaryDirectory() as directory:

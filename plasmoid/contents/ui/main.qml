@@ -1,6 +1,7 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
+import QtQuick.Controls as QQC
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.components as PlasmaComponents
@@ -21,13 +22,17 @@ PlasmoidItem {
     readonly property bool ready: phase !== ""
     readonly property bool previewing: phase === "preparing preview" || phase === "previewing"
     readonly property bool reading: ready && phase !== "idle" && !previewing
+    readonly property bool paused: phase === "paused"
+    readonly property bool canControlPlayback: paused || phase === "speaking" || phase === "preparing audio"
     readonly property string statusText: {
         switch (phase) {
-        case "idle": return i18n("Ctrl+Esc to read")
+        case "idle": return reader.properties.ReadingError || i18n("Ready to read")
         case "finding text": return i18n("Finding text…")
         case "recognizing text": return i18n("Recognizing text…")
         case "preparing audio": return i18n("Preparing audio…")
         case "speaking": return i18n("Reading aloud")
+        case "paused": return i18n("Reading paused")
+        case "announcing status": return i18n("Reporting reading status")
         case "preparing preview": return i18n("Preparing voice preview…")
         case "previewing": return i18n("Playing voice preview")
         default: return i18n("The read-aloud service is unavailable.")
@@ -89,6 +94,52 @@ PlasmoidItem {
                 spacing: Kirigami.Units.smallSpacing
 
                 PlasmaComponents.Label {
+                    Layout.fillWidth: true
+                    text: root.statusText
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    PlaybackButton {
+                        text: i18n("Previous sentence")
+                        icon.name: "media-skip-backward"
+                        enabled: reader.properties.CanGoBack === true
+                        onClicked: root.callReader("PreviousSentence", [])
+                    }
+
+                    PlaybackButton {
+                        text: root.paused ? i18n("Resume reading") : i18n("Pause reading")
+                        icon.name: root.paused ? "media-playback-start" : "media-playback-pause"
+                        enabled: root.canControlPlayback
+                        onClicked: root.callReader("TogglePause", [])
+                    }
+
+                    PlaybackButton {
+                        text: i18n("Next sentence")
+                        icon.name: "media-skip-forward"
+                        enabled: reader.properties.CanGoForward === true
+                        onClicked: root.callReader("NextSentence", [])
+                    }
+
+                    PlaybackButton {
+                        text: i18n("Stop reading")
+                        icon.name: "media-playback-stop"
+                        enabled: root.reading
+                        onClicked: root.callReader("Stop", [])
+                    }
+                }
+
+                PlasmaComponents.Label {
+                    Layout.fillWidth: true
+                    text: i18n("Default shortcuts\nCtrl+Alt+R reads at the pointer.\nCtrl+Alt+Enter reads keyboard focus.\nTap Ctrl to stop.")
+                    wrapMode: Text.Wrap
+                }
+
+                PlasmaComponents.Label {
+                    Layout.topMargin: Kirigami.Units.largeSpacing
                     text: i18n("Voice")
                 }
 
@@ -168,23 +219,6 @@ PlasmoidItem {
                     }
                 }
 
-                RowLayout {
-                    Layout.topMargin: Kirigami.Units.largeSpacing
-
-                    PlasmaComponents.Label {
-                        Layout.fillWidth: true
-                        text: root.statusText
-                        wrapMode: Text.Wrap
-                    }
-
-                    PlasmaComponents.Button {
-                        text: i18n("Stop reading")
-                        icon.name: "media-playback-stop"
-                        enabled: root.reading
-                        onClicked: root.callReader("Stop", [])
-                    }
-                }
-
                 PlasmaComponents.Label {
                     Layout.fillWidth: true
                     visible: text.length > 0
@@ -195,5 +229,14 @@ PlasmoidItem {
                 }
             }
         }
+    }
+
+    component PlaybackButton: PlasmaComponents.Button {
+        Layout.fillWidth: true
+        display: PlasmaComponents.Button.IconOnly
+        Accessible.name: text
+        QQC.ToolTip.text: text
+        QQC.ToolTip.visible: hovered || activeFocus
+        QQC.ToolTip.delay: Kirigami.Units.toolTipDelay
     }
 }

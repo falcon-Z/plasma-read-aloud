@@ -33,13 +33,19 @@ if [[ ${1:-} == --with-piper ]]; then
     piper_python=${2:-python3.14}
     "$piper_python" -m venv "$base/piper"
     "$base/piper/bin/python" -m pip install 'piper-tts==1.7.0'
-    (
-        cd -- "$base/voices"
-        "$base/piper/bin/python" -m piper.download_voices en_US-lessac-medium
-    )
+    "$base/piper/bin/python" -m piper.download_voices --download-dir "$base/voices" \
+        en_US-lessac-medium en_US-ryan-medium en_GB-alba-medium
 elif [[ $# != 0 ]]; then
     echo "Usage: ./install [--with-piper [path-to-python-3.14]]" >&2
     exit 2
+fi
+
+install -Dm644 plasmoid/contents/icons/select-to-speak-symbolic.svg \
+    "$data_home/icons/hicolor/scalable/apps/select-to-speak-symbolic.svg"
+if [[ -d "$data_home/plasma/plasmoids/org.kde.plasma.selecttospeak" ]]; then
+    kpackagetool6 --type Plasma/Applet --upgrade plasmoid
+else
+    kpackagetool6 --type Plasma/Applet --install plasmoid
 fi
 
 if systemctl --user is-active --quiet select-to-speak.service; then

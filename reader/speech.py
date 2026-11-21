@@ -1,5 +1,6 @@
 """Offline speech synthesis and cancellable playback."""
 
+from dataclasses import dataclass
 import json
 import logging
 import math
@@ -12,7 +13,12 @@ import subprocess
 import time
 
 LOG = logging.getLogger(__name__)
-VOICE = "en_US-lessac-medium"
+DEFAULT_VOICE = "en_US-lessac-medium"
+VOICE_LABELS = {
+    DEFAULT_VOICE: "Lessac · US English",
+    "en_US-ryan-medium": "Ryan · US English",
+    "en_GB-alba-medium": "Alba · UK English",
+}
 CUE_RATE = 24000
 
 
@@ -43,12 +49,43 @@ def reap(process):
     process.wait()
 
 
+@dataclass(frozen=True)
+class VoiceOption:
+    label: str
+    model: Path | None
+
+
+def piper_python(base):
+    return Path(os.environ.get("SELECT_TO_SPEAK_PIPER", base / "piper/bin/python"))
+
+
+def discover_voices(base):
+    options = {}
+    if piper_python(base).is_file():
+        directory = base / "voices"
+        models = [directory / f"{name}.onnx" for name in VOICE_LABELS]
+        models.extend(path for path in sorted(directory.glob("*.onnx")) if path.stem not in VOICE_LABELS)
+        for path in models:
+            if path.is_file() and path.with_suffix(".onnx.json").is_file():
+                options[path.stem] = VoiceOption(VOICE_LABELS.get(path.stem, path.stem), path.absolute())
+        if configured := os.environ.get("SELECT_TO_SPEAK_VOICE"):
+            path = Path(configured).absolute()
+            if path.is_file() and path.with_name(path.name + ".json").is_file():
+                name = next((name for name, option in options.items() if option.model == path), "configured")
+                option = options.pop(name, VoiceOption(f"{path.stem} · Piper", path))
+                options = {name: option, **options}
+    if shutil.which("espeak-ng"):
+        options["espeak-ng"] = VoiceOption("eSpeak NG · System voice", None)
+    return options
+
+
 class Voice:
-    def __init__(self, base):
-        self.python = Path(os.environ.get("SELECT_TO_SPEAK_PIPER", base / "piper/bin/python"))
-        self.model = Path(os.environ.get("SELECT_TO_SPEAK_VOICE", base / "voices" / f"{VOICE}.onnx"))
+    def __init__(self, base, model, *, allow_fallback=True):
+        self.python = piper_python(base)
+        self.model = model
         self.process = None
-        self.use_piper = self.python.is_file() and self.model.is_file()
+        self.use_piper = model is not None
+        self.allow_fallback = allow_fallback
         self.espeak = shutil.which("espeak-ng")
         self.player = shutil.which("paplay")
         if not self.player or not (self.use_piper or self.espeak):
@@ -57,6 +94,12 @@ class Voice:
     @property
     def name(self):
         return "Piper" if self.use_piper else "eSpeak NG"
+
+    def select(self, model):
+        if model != self.model:
+            self.close()
+            self.model = model
+            self.use_piper = model is not None
 
     def play_cue(self, cue):
         subprocess.run(
@@ -93,7 +136,7 @@ class Voice:
 
     def fallback(self, error):
         self.close()
-        if not self.espeak:
+        if not self.espeak or not self.allow_fallback:
             raise error
         self.use_piper = False
         LOG.warning("Piper unavailable, switching to eSpeak NG (%s)", error)

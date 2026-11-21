@@ -1,8 +1,12 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from reader import service
 from reader.model import Utterance
+from reader.settings import load_settings
+from reader.speech import VoiceOption
 
 
 class ShortcutTests(unittest.TestCase):
@@ -18,7 +22,10 @@ class ShortcutTests(unittest.TestCase):
         self.reader.rate = 1.2
         self.reader.pool = Mock()
         self.reader.access_context = Mock()
-        self.reader.tray = Mock()
+        self.reader.voice_id = "lessac"
+        self.reader.voices = {"lessac": VoiceOption("Lessac", Path("lessac.onnx")),
+                              "alba": VoiceOption("Alba", Path("alba.onnx"))}
+        self.reader.preview_error = ""
         self.reader.highlight = Mock()
         self.reader.cue = Mock()
         self.reader.notify = Mock()
@@ -140,6 +147,7 @@ class ShortcutTests(unittest.TestCase):
         self.assertEqual(self.reader.phase, "idle")
 
     def test_selection_plays_every_sentence_without_ocr(self):
+        self.reader.voice_id = "alba"
         self.reader.start(self.request)
         voice = self.reader.voice = Mock()
         reading = Mock(mode="selection")
@@ -154,6 +162,7 @@ class ShortcutTests(unittest.TestCase):
             self.reader.run(self.request, self.reader.job)
 
         recognize.assert_not_called()
+        voice.select.assert_called_once_with(self.reader.voices["alba"].model)
         self.assertEqual([call.args for call in voice.queue.call_args_list],
                          [("First sentence.", 1.2), ("Second sentence.", 1.2)])
         self.assertEqual(voice.play.call_count, 2)
@@ -194,3 +203,43 @@ class ShortcutTests(unittest.TestCase):
 
         self.reader.voice.play.assert_not_called()
         self.reader.notify.assert_not_called()
+
+    def test_preview_uses_candidate_without_changing_saved_voice(self):
+        self.reader.start_preview("alba")
+        cancel = self.reader.job
+        candidate = self.reader.voices["alba"].model
+        self.reader.pool.submit.assert_called_once_with(self.reader.run_preview, candidate, cancel)
+        self.assertEqual(self.reader.phase, "preparing preview")
+
+        with (
+            patch.object(service, "Voice") as voice_factory,
+            patch.object(service.GLib, "idle_add", side_effect=lambda fn, *args: fn(*args)),
+        ):
+            self.reader.run_preview(candidate, cancel)
+
+        voice_factory.assert_called_once_with(self.reader.base, candidate, allow_fallback=False)
+        voice = voice_factory.return_value
+        voice.queue.assert_called_once_with(service.PREVIEW_TEXT, self.reader.rate)
+        voice.play.assert_called_once()
+        voice.close.assert_called_once()
+        self.assertEqual(self.reader.voice_id, "lessac")
+        self.assertEqual(self.reader.phase, "idle")
+        self.assertEqual(self.escape_bindings(), [[([service.QT_ESCAPE],)], []])
+
+    def test_saved_voice_and_rate_preserve_each_other(self):
+        with TemporaryDirectory() as directory:
+            self.reader.settings = Path(directory) / "settings.json"
+            self.reader.change_rate(1.35)
+            self.reader.change_voice("alba")
+            self.assertEqual(load_settings(self.reader.settings), {"rate": 1.35, "voice": "alba"})
+            self.reader.change_rate(1.05)
+            self.assertEqual(load_settings(self.reader.settings), {"rate": 1.05, "voice": "alba"})
+
+    def test_cancelled_preview_cannot_overwrite_new_reading(self):
+        self.reader.start_preview("alba")
+        preview = self.reader.job
+        self.reader.start(self.request)
+        self.reader.finish_preview(preview, "Old failure")
+        self.assertTrue(preview.is_set())
+        self.assertEqual(self.reader.phase, "finding text")
+        self.assertEqual(self.reader.preview_error, "")

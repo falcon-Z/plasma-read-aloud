@@ -1,4 +1,4 @@
-"""Persist the speech rate in the user's configuration directory."""
+"""Persist speech settings in the user's configuration directory."""
 
 import json
 import logging
@@ -18,13 +18,24 @@ def normalize_rate(value):
     return round(rate, 2)
 
 
-def load_rate(path):
+def load_settings(path):
     try:
-        return normalize_rate(json.loads(path.read_text(encoding="utf-8"))["rate"])
+        values = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(values, dict):
+            return values
     except FileNotFoundError:
         pass
-    except (OSError, ValueError, KeyError, TypeError):
-        logging.getLogger(__name__).warning("Could not load the saved speech rate")
+    except (OSError, ValueError):
+        logging.getLogger(__name__).warning("Could not load the saved speech settings")
+    return {}
+
+
+def load_rate(path):
+    if "rate" in (saved := load_settings(path)):
+        try:
+            return normalize_rate(saved["rate"])
+        except (ValueError, TypeError):
+            logging.getLogger(__name__).warning("Could not load the saved speech rate")
     try:
         return normalize_rate(os.environ.get("SELECT_TO_SPEAK_RATE", DEFAULT_RATE))
     except ValueError:
@@ -32,11 +43,17 @@ def load_rate(path):
 
 
 def save_rate(path, rate):
+    save_settings(path, rate=rate)
+
+
+def save_settings(path, **changes):
+    values = load_settings(path)
+    values.update(changes)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False, encoding="utf-8") as file:
         temporary = Path(file.name)
         try:
-            json.dump({"rate": rate}, file)
+            json.dump(values, file)
             file.write("\n")
             file.close()
             temporary.replace(path)

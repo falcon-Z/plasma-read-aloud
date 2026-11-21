@@ -12,8 +12,8 @@ import threading
 from gi.repository import Gio, GLib, GLibUnix
 
 from . import access, ocr
-from .settings import load_rate, normalize_rate, save_rate
-from .speech import Cancelled, Voice
+from .settings import load_rate, load_settings, normalize_rate, save_rate, save_settings
+from .speech import Cancelled, Voice, discover_voices
 
 NAME = "org.kde.SelectToSpeak"
 PATH = "/SelectToSpeak"
@@ -23,6 +23,7 @@ QT_ESCAPE = 0x01000000
 EMPTY = ("No readable text found at the pointer", "Point at text or a control, or select some text and try again.")
 PROTECTED = ("This field is protected", "Protected text can't be read aloud.")
 FAILED = ("Couldn't read aloud", "Use the read-aloud shortcut to try again.")
+PREVIEW_TEXT = "Hello! This is how I sound when I read aloud. The quick brown fox jumps over the lazy dog."
 INTERFACE = f"""
 <node>
   <interface name="{NAME}">
@@ -31,10 +32,17 @@ INTERFACE = f"""
     <method name="Stop"/>
     <method name="GetRate"><arg name="rate" direction="out" type="d"/></method>
     <method name="SetRate"><arg name="rate" direction="in" type="d"/></method>
+    <method name="SetVoice"><arg name="voice" direction="in" type="s"/></method>
+    <method name="PreviewVoice"><arg name="voice" direction="in" type="s"/></method>
     <method name="Status">
       <arg name="phase" direction="out" type="s"/>
       <arg name="voice" direction="out" type="s"/>
     </method>
+    <property name="Phase" type="s" access="read"/>
+    <property name="Rate" type="d" access="read"/>
+    <property name="Voices" type="s" access="read"/>
+    <property name="VoiceId" type="s" access="read"/>
+    <property name="PreviewError" type="s" access="read"/>
   </interface>
 </node>
 """
@@ -49,7 +57,16 @@ class Reader:
         self.bus = bus
         self.rate = load_rate(settings)
         self.highlight = Highlight()
-        self.voice = Voice(base)
+        self.voices = discover_voices(base)
+        if not self.voices:
+            raise RuntimeError("Install Piper with a voice or eSpeak NG.")
+        saved_voice = load_settings(settings).get("voice")
+        self.voice_id = (saved_voice if isinstance(saved_voice, str) and saved_voice in self.voices
+                         else next(iter(self.voices)))
+        self.voice = Voice(base, self.voices[self.voice_id].model)
+        self.voice_options = json.dumps([{"id": name, "label": option.label}
+                                         for name, option in self.voices.items()])
+        self.preview_error = ""
         self.access_context = GLib.MainContext.new()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, initializer=self.init_access)
         self.cues = (concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -58,7 +75,6 @@ class Reader:
         self.task = None
         self.feedback_job = None
         self.phase = "idle"
-        self.tray = None
         self.pool.submit(self.voice.warm)
         self.locked = False
 
@@ -69,18 +85,42 @@ class Reader:
         access.A.set_main_context(self.access_context)
         access.A.set_timeout(800, 1000)
 
-    def attach_tray(self, bus):
-        from .tray import Tray
+    def get_property(self, bus, sender, path, interface, name):
+        if name == "Rate":
+            return GLib.Variant("d", self.rate)
+        return GLib.Variant("s", {
+            "Phase": self.phase,
+            "Voices": self.voice_options,
+            "VoiceId": self.voice_id,
+            "PreviewError": self.preview_error,
+        }[name])
 
-        self.tray = Tray(bus, self.change_rate, self.stop)
-        self.tray.update(self.phase, self.rate)
+    def publish(self, **changes):
+        self.bus.emit_signal(
+            None, PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+            GLib.Variant("(sa{sv}as)", (NAME, changes, [])),
+        )
 
     def change_rate(self, rate):
         rate = normalize_rate(rate)
         if rate != self.rate or not self.settings.exists():
             save_rate(self.settings, rate)
         self.rate = rate
-        self.tray.update(self.phase, self.rate)
+        self.publish(Rate=GLib.Variant("d", rate))
+
+    def change_voice(self, voice_id):
+        if voice_id not in self.voices:
+            raise ValueError("This voice is unavailable.")
+        if voice_id != self.voice_id:
+            save_settings(self.settings, voice=voice_id)
+            self.voice_id = voice_id
+            self.publish(VoiceId=GLib.Variant("s", voice_id))
+        self.set_preview_error("")
+
+    def set_preview_error(self, message):
+        if self.preview_error != message:
+            self.preview_error = message
+            self.publish(PreviewError=GLib.Variant("s", message))
 
     def set_escape(self, enabled):
         keys = [([QT_ESCAPE],)] if enabled else []
@@ -96,14 +136,27 @@ class Reader:
     def start(self, request):
         if self.locked:
             return
+        cancel = self.begin("finding text")
+        self.cue("accepted", cancel)
+        self.task = self.pool.submit(self.run, request, cancel)
+
+    def start_preview(self, voice_id):
+        if voice_id not in self.voices:
+            raise ValueError("This voice is unavailable.")
+        if self.locked or self.job is not None:
+            raise ValueError("Voice preview is only available while the reader is idle.")
+        self.set_preview_error("")
+        cancel = self.begin("preparing preview")
+        self.task = self.pool.submit(self.run_preview, self.voices[voice_id].model, cancel)
+
+    def begin(self, phase):
         idle = self.job is None
         self.cancel_current()
         cancel = self.job = threading.Event()
         if idle:
             self.set_escape(True)
-        self.update(cancel, "finding text", [])
-        self.cue("accepted", cancel)
-        self.task = self.pool.submit(self.run, request, cancel)
+        self.update(cancel, phase, [])
+        return cancel
 
     def cancel_current(self):
         if self.feedback_job is not None:
@@ -121,14 +174,44 @@ class Reader:
     def update(self, cancel, phase, boxes=None):
         if self.job is not cancel:
             return
-        self.phase = phase
+        if self.phase != phase:
+            self.phase = phase
+            self.publish(Phase=GLib.Variant("s", phase))
         if phase == "idle":
             self.job = None
             self.task = None
             self.set_escape(False)
         if boxes is not None:
             self.highlight.update(boxes)
-        self.tray.update(phase, self.rate)
+
+    def run_preview(self, model, cancel):
+        error = ""
+        try:
+            if cancel.is_set():
+                return
+            voice = Voice(self.base, model, allow_fallback=False)
+            try:
+                rate = self.rate
+                voice.queue(PREVIEW_TEXT, rate)
+                wav = voice.receive(PREVIEW_TEXT, rate, cancel)
+                if not wav:
+                    raise OSError("The voice returned no audio")
+                GLib.idle_add(self.update, cancel, "previewing")
+                voice.play(wav, cancel, lambda: None)
+            finally:
+                voice.close()
+        except Cancelled:
+            pass
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            LOG.exception("Voice preview failed")
+            error = "Could not play this voice preview."
+        finally:
+            GLib.idle_add(self.finish_preview, cancel, error)
+
+    def finish_preview(self, cancel, error):
+        if self.job is cancel:
+            self.set_preview_error(error)
+            self.update(cancel, "idle", [])
 
     def cue(self, kind, cancel):
         if self.cues is not None:
@@ -182,7 +265,7 @@ class Reader:
                 "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications", "Notify",
                 GLib.Variant("(susssasa{sv}i)", (
-                    "Select to Speak", 0, "text-to-speech", summary, body, [],
+                    "Select to Speak", 0, "select-to-speak-symbolic", summary, body, [],
                     {"transient": GLib.Variant("b", True)}, 2500,
                 )), None, Gio.DBusCallFlags.NONE, 750, None, None, None,
             )
@@ -199,6 +282,7 @@ class Reader:
         audio_pending = False
         try:
             check()
+            self.voice.select(self.voices[self.voice_id].model)
             reading = access.resolve(request, check)
             check()
             remaining = iter(reading.utterances()) if reading else iter(())
@@ -298,6 +382,13 @@ class Reader:
             except (ValueError, OSError) as exc:
                 reply.return_dbus_error(NAME + ".RateError", str(exc))
                 return
+        elif method in ("SetVoice", "PreviewVoice"):
+            change = self.change_voice if method == "SetVoice" else self.start_preview
+            try:
+                change(parameters.unpack()[0])
+            except (ValueError, OSError) as exc:
+                reply.return_dbus_error(NAME + ".VoiceError", str(exc))
+                return
         else:
             try:
                 request = json.loads(parameters.unpack()[0])
@@ -356,7 +447,7 @@ def main():
     node = Gio.DBusNodeInfo.new_for_xml(INTERFACE)
     reader = Reader(base, config / "settings.json", bus)
     reader.loop = loop
-    bus.register_object(PATH, node.interfaces[0], reader.handle, None, None)
+    bus.register_object(PATH, node.interfaces[0], reader.handle, reader.get_property, None)
     reply = bus.call_sync(
         "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
         "RequestName", GLib.Variant("(su)", (NAME, 4)), None, Gio.DBusCallFlags.NONE, 1000, None,
@@ -365,7 +456,6 @@ def main():
         reader.close()
         raise RuntimeError(f"{NAME} is already running")
     reader.set_escape(False)
-    reader.attach_tray(bus)
     bus.signal_subscribe("org.freedesktop.ScreenSaver", "org.freedesktop.ScreenSaver",
                          "ActiveChanged", None, None, Gio.DBusSignalFlags.NONE, reader.lock_changed)
     try:

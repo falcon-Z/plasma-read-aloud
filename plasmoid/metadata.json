@@ -1,0 +1,16 @@
+{
+    "KPlugin": {
+        "Id": "org.kde.plasma.selecttospeak",
+        "Name": "Select to Speak",
+        "Description": "Choose a voice and control read-aloud playback",
+        "Icon": "select-to-speak-symbolic",
+        "Category": "Accessibility",
+        "License": "MIT",
+        "Version": "1.0",
+        "EnabledByDefault": true
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.4",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

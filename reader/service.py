@@ -18,11 +18,13 @@ from .speech import Cancelled, Voice
 NAME = "org.kde.SelectToSpeak"
 PATH = "/SelectToSpeak"
 LOG = logging.getLogger("select-to-speak")
-EMPTY = ("Nothing readable here", "Point at text or a control, or select some text and try again.")
+EMPTY = ("No readable text found at the pointer", "Point at text or a control, or select some text and try again.")
+PROTECTED = ("This field is protected", "Protected text can't be read aloud.")
 FAILED = ("Couldn't read aloud", "Press Alt+Esc to try again.")
 INTERFACE = f"""
 <node>
   <interface name="{NAME}">
+    <method name="Read"><arg direction="in" type="s"/></method>
     <method name="ReadOrStop"><arg direction="in" type="s"/></method>
     <method name="Stop"/>
     <method name="GetRate"><arg name="rate" direction="out" type="d"/></method>
@@ -49,6 +51,8 @@ class Reader:
         self.cues = (concurrent.futures.ThreadPoolExecutor(max_workers=1)
                      if os.environ.get("SELECT_TO_SPEAK_AUDIO_CUES", "1") != "0" else None)
         self.job = None
+        self.task = None
+        self.feedback_job = None
         self.phase = "idle"
         self.tray = None
         self.pool.submit(self.voice.warm)
@@ -70,18 +74,19 @@ class Reader:
     def start(self, request):
         if self.locked:
             return
-        if self.job is not None:
-            if self.phase == "speaking":
-                self.stop()
-            return
+        self.stop()
         cancel = self.job = threading.Event()
         self.update(cancel, "finding text")
         self.cue("accepted", cancel)
-        self.pool.submit(self.run, request, cancel)
+        self.task = self.pool.submit(self.run, request, cancel)
 
     def stop(self):
+        if self.feedback_job is not None:
+            self.feedback_job.set()
+            self.feedback_job = None
         if self.job is not None:
             self.job.set()
+            self.task.cancel()
             self.update(self.job, "idle", [])
 
     def update(self, cancel, phase, boxes=None):
@@ -90,12 +95,14 @@ class Reader:
         self.phase = phase
         if phase == "idle":
             self.job = None
+            self.task = None
         if boxes is not None:
             self.highlight.update(boxes)
         self.tray.update(phase, self.rate)
 
     def cue(self, kind, cancel):
         if self.cues is not None:
+            self.feedback_job = cancel
             self.cues.submit(self.play_cue, kind, cancel)
 
     def play_cue(self, kind, cancel):
@@ -105,13 +112,31 @@ class Reader:
             except (OSError, subprocess.SubprocessError) as exc:
                 LOG.warning("Could not play shortcut feedback: %s", exc)
 
-    def finish(self, cancel, outcome):
+    def finish(self, cancel, outcome, spoken=False):
         if self.job is not cancel:
             return
         self.update(cancel, "idle", [])
         if outcome is not None:
-            self.cue("unavailable", cancel)
+            if not spoken:
+                self.cue("unavailable", cancel)
             self.notify(*outcome)
+
+    def announce(self, message, cancel):
+        if cancel.is_set():
+            return False
+        rate = self.rate
+        try:
+            GLib.idle_add(self.update, cancel, "speaking", [])
+            self.voice.queue(message, rate)
+            wav = self.voice.receive(message, rate, cancel)
+            self.voice.play(wav, cancel, lambda: None)
+            return True
+        except Cancelled:
+            self.voice.close()
+        except Exception:
+            self.voice.close()
+            LOG.exception("Could not speak the reading status")
+        return False
 
     def lock_changed(self, bus, sender, path, interface, member, data):
         self.locked, = data.unpack()
@@ -142,6 +167,7 @@ class Reader:
         try:
             check()
             reading = access.resolve(request, check)
+            check()
             remaining = iter(reading.utterances()) if reading else iter(())
             current = next(remaining, None)
             if current is None:
@@ -173,6 +199,7 @@ class Reader:
                     audio_pending = True
                     continue
                 following = next(remaining, None)
+                check()
                 if following is not None:
                     self.voice.queue(following.text, queued_rate)
                     audio_pending = True
@@ -198,7 +225,7 @@ class Reader:
                 self.voice.play(wav, cancel, refresh)
                 current = following
         except access.ProtectedText:
-            outcome = EMPTY
+            outcome = PROTECTED
         except Cancelled:
             LOG.info("Read request cancelled")
             if audio_pending:
@@ -208,7 +235,8 @@ class Reader:
             LOG.exception("Reading failed")
             outcome = FAILED
         finally:
-            GLib.idle_add(self.finish, cancel, outcome)
+            spoken = outcome is not None and self.announce(outcome[0] + ".", cancel)
+            GLib.idle_add(self.finish, cancel, outcome, spoken)
 
     def close(self, *_):
         self.stop()
@@ -274,10 +302,20 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "select-to-speak"
     config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "select-to-speak"
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    # The accessibility bus starts with assistive technology disabled in some
+    # Plasma sessions, even when the desktop setting was saved at install time.
+    try:
+        bus.call_sync(
+            "org.a11y.Bus", "/org/a11y/bus", "org.freedesktop.DBus.Properties", "Set",
+            GLib.Variant("(ssv)", ("org.a11y.Status", "IsEnabled", GLib.Variant("b", True))),
+            None, Gio.DBusCallFlags.NONE, 2000, None,
+        )
+    except GLib.Error as exc:
+        LOG.warning("Could not enable desktop accessibility: %s", exc.message)
     access.A.init()
     access.A.set_timeout(800, 1000)
     loop = GLib.MainLoop()
-    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
     node = Gio.DBusNodeInfo.new_for_xml(INTERFACE)
     reader = Reader(base, config / "settings.json")
     reader.loop = loop

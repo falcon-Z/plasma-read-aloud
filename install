@@ -6,7 +6,7 @@ if [[ ${XDG_SESSION_TYPE:-} != wayland || ${XDG_CURRENT_DESKTOP:-} != *KDE* ]]; 
     echo "Run this installer inside a KDE Plasma Wayland session." >&2
     exit 1
 fi
-for bin in busctl gdbus gsettings kpackagetool6 kwriteconfig6 paplay systemctl; do
+for bin in busctl gsettings kpackagetool6 kwriteconfig6 paplay systemctl; do
     command -v "$bin" >/dev/null || { echo "Missing dependency $bin" >&2; exit 1; }
 done
 
@@ -51,7 +51,7 @@ cat > "$config_home/systemd/user/select-to-speak.service" <<UNIT
 [Unit]
 Description=Select to Speak
 PartOf=graphical-session.target
-After=graphical-session-pre.target
+After=graphical-session-pre.target plasma-kwin_wayland.service
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
@@ -65,10 +65,8 @@ RestartSec=2
 WantedBy=graphical-session.target
 UNIT
 
-# Enable the accessibility bridge for Wayland apps and the current session.
+# Enable desktop accessibility for apps. The reader enables the session bus at startup.
 gsettings set org.gnome.desktop.interface toolkit-accessibility true
-gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
-    --method org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled '<true>' >/dev/null
 
 if [[ -d "$data_home/kwin/scripts/select-to-speak" ]]; then
     busctl --user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s select-to-speak >/dev/null

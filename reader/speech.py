@@ -142,6 +142,8 @@ class Voice:
             reap(process)
 
     def play(self, wav, cancel, refresh):
+        if cancel.is_set():
+            raise Cancelled
         with os.fdopen(os.memfd_create("select-to-speak"), "w+b") as audio:
             audio.write(wav)
             audio.seek(0)

@@ -81,14 +81,87 @@ class ReadingTests(unittest.TestCase):
             reading = access.pointer_reading(surface, (140, 45), lambda: None)
         self.assertEqual([u.text for u in reading.utterances()], ["Enable alerts"])
 
-    def test_container_padding_reads_visible_child_content(self):
+    def test_gtk_window_coordinates_distinguish_rate_label_and_shortcut_hint(self):
+        rate = accessible(access.ROLE.LABEL, "Speech rate", Rect(18, 16, 160, 20))
+        hint = accessible(access.ROLE.LABEL, "Alt+Esc to read", Rect(18, 103, 160, 20))
+        stop = accessible(access.ROLE.PUSH_BUTTON, "Stop reading", Rect(200, 103, 111, 20))
+        frame = accessible(access.ROLE.FRAME, "Reader", Rect(0, 0, 345, 153), rate, hint, stop)
+        window = {"client": [787, 467, 345, 153], "frame": [787, 439, 345, 181]}
+
+        def extents(node, mode):
+            box = node.bounds
+            return box if mode == access.WINDOW else Rect(0, 0, box.w, box.h)
+
+        with patch.object(access, "extents", side_effect=extents):
+            surface = access.Surface.create(frame, window, "gtk")
+            self.assertEqual(surface.mode, access.WINDOW)
+            for node in (rate, hint, stop):
+                with self.subTest(label=node.get_name()):
+                    box = surface.box(node)
+                    self.assertEqual(box, node.bounds.move(787, 467))
+                    reading = access.pointer_reading(surface, (box.x + 5, box.y + 5), lambda: None)
+                    utterance, = reading.utterances()
+                    self.assertEqual(utterance.text, node.get_name())
+                    self.assertEqual(reading.rectangles(utterance), [box])
+
+    def test_container_padding_does_not_read_an_unrelated_child(self):
         label = accessible(access.ROLE.STATIC, "Visible heading", Rect(15, 15, 70, 15))
         panel = accessible(access.ROLE.SECTION, "", Rect(10, 10, 100, 60), label)
         frame = accessible(access.ROLE.FRAME, "", Rect(0, 0, 250, 200), panel)
         surface = access.Surface(frame, frame.bounds, access.SCREEN, 0, 0)
         with patch.object(access, "extents", side_effect=lambda node, _: node.bounds):
             reading = access.pointer_reading(surface, (102, 65), lambda: None)
-        self.assertEqual([u.text for u in reading.utterances()], ["Visible heading"])
+        self.assertIsNone(reading)
+
+    def test_web_prose_continues_past_controls_without_reading_them(self):
+        first = accessible(access.ROLE.PARAGRAPH, "", Rect(20, 20, 140, 20))
+        play = accessible(access.ROLE.PUSH_BUTTON, "Pause reply audio", Rect(20, 50, 35, 20))
+        editor = accessible(access.ROLE.ENTRY, "", Rect(20, 80, 140, 20))
+        second = accessible(access.ROLE.PARAGRAPH, "", Rect(20, 110, 140, 20))
+        article = accessible(access.ROLE.ARTICLE, "Article", Rect(10, 10, 200, 140), first, play, editor, second)
+        document = accessible(access.ROLE.DOCUMENT_WEB, "", Rect(0, 0, 250, 200), article)
+        surface = access.Surface(document, document.bounds, access.SCREEN, 0, 0)
+        values = {first: "Start here. Keep reading.", second: "Later paragraph.", editor: "Editor input."}
+
+        with (
+            patch.object(access, "extents", side_effect=lambda node, _: node.bounds),
+            patch.object(access, "text_of", side_effect=lambda node: values.get(node, "")),
+            patch.object(surface, "offset", return_value=12),
+        ):
+            reading = access.pointer_reading(surface, (25, 25), lambda: None)
+            self.assertEqual([u.text for u in reading.utterances()], ["Keep reading.", "Later paragraph."])
+            reading = access.pointer_reading(surface, (25, 55), lambda: None)
+            self.assertEqual([u.text for u in reading.utterances()], ["Pause reply audio"])
+            self.assertIsNone(access.pointer_reading(surface, (200, 125), lambda: None))
+
+    def test_ocr_joins_split_inline_words_without_crossing_columns(self):
+        words = [
+            ocr.Word("Press", Rect(20, 20, 35, 15), (1,), (1, 1)),
+            ocr.Word("Alt+Esc", Rect(62, 19, 51, 18), (2,), (2, 1)),
+            ocr.Word("to", Rect(118, 20, 15, 15), (3,), (3, 1)),
+            ocr.Word("read.", Rect(139, 21, 32, 14), (3,), (3, 1)),
+            ocr.Word("Pause", Rect(285, 20, 45, 15), (4,), (4, 1)),
+        ]
+        reading = ocr.ImageReading(ocr.paragraph_at(words, (66, 24)))
+        utterance, = reading.utterances()
+        self.assertEqual(utterance.text, "Alt+Esc to read.")
+        self.assertEqual(reading.rectangles(utterance), [Rect(62, 19, 109, 18)])
+
+    def test_static_text_hit_continues_when_provider_has_no_character_offset(self):
+        first = accessible(access.ROLE.STATIC, "Press ", Rect(20, 20, 40, 20))
+        second = accessible(access.ROLE.STATIC, "Alt+Esc to read.", Rect(60, 20, 100, 20))
+        paragraph = accessible(access.ROLE.PARAGRAPH, "", Rect(20, 20, 180, 20), first, second)
+        document = accessible(access.ROLE.DOCUMENT_WEB, "", Rect(0, 0, 250, 200), paragraph)
+        surface = access.Surface(document, document.bounds, access.SCREEN, 0, 0)
+        values = {first: "Press ", second: "Alt+Esc to read."}
+        with (
+            patch.object(access, "extents", side_effect=lambda node, _: node.bounds),
+            patch.object(access, "text_of", side_effect=lambda node: values.get(node, "")),
+            patch.object(surface, "offset", return_value=-1),
+        ):
+            reading = access.pointer_reading(surface, (22, 24), lambda: None)
+
+        self.assertEqual([u.text for u in reading.utterances()], ["Press Alt+Esc to read."])
 
     def test_ocr_uses_target_and_keeps_screen_coordinates(self):
         bounds = Rect(300, 150, 650, 350)

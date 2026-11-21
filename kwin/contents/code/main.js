@@ -47,7 +47,7 @@ function send(method, ...args) {
 function read() {
     const point = workspace.cursorPos;
     const screen = workspace.screenAt(point);
-    send("ReadOrStop", JSON.stringify({
+    send("Read", JSON.stringify({
         point: [Math.round(point.x), Math.round(point.y)],
         screen: screen ? geometry(screen.geometry) : null,
         desktop: geometry(workspace.virtualScreenGeometry),
@@ -56,7 +56,8 @@ function read() {
     }));
 }
 
-registerShortcut("Select to Speak: Read or stop", "Select to Speak: Read or stop",
+// Keep the existing action ID so assigned shortcuts survive an upgrade.
+registerShortcut("Select to Speak: Read or stop", "Select to Speak: Read aloud",
     "Alt+Esc", read);
 // KWin triggers a bare modifier on release and leaves Ctrl combinations alone.
 registerShortcut("Select to Speak: Stop with Ctrl", "Select to Speak: Stop with Ctrl",

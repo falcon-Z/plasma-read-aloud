@@ -19,20 +19,20 @@ DOCUMENTS = {ROLE.DOCUMENT_WEB, ROLE.DOCUMENT_TEXT, ROLE.DOCUMENT_FRAME,
              ROLE.DOCUMENT_EMAIL, ROLE.DOCUMENT_PRESENTATION, ROLE.DOCUMENT_SPREADSHEET}
 BLOCKS = DOCUMENTS | {ROLE.ARTICLE, ROLE.PARAGRAPH, ROLE.HEADING, ROLE.LIST_ITEM,
                       ROLE.BLOCK_QUOTE, ROLE.TABLE_CELL, ROLE.LANDMARK, ROLE.FORM}
-CONTROLS = {ROLE.PUSH_BUTTON, ROLE.PUSH_BUTTON_MENU, ROLE.TOGGLE_BUTTON, ROLE.CHECK_BOX,
-            ROLE.RADIO_BUTTON, ROLE.MENU, ROLE.MENU_ITEM, ROLE.CHECK_MENU_ITEM,
-            ROLE.RADIO_MENU_ITEM, ROLE.PAGE_TAB, ROLE.COMBO_BOX, ROLE.SLIDER, ROLE.SPIN_BUTTON,
-            ROLE.DIAL, ROLE.SCROLL_BAR, ROLE.PROGRESS_BAR, ROLE.TREE_ITEM, ROLE.TABLE_ROW,
-            ROLE.DESKTOP_ICON, ROLE.COLUMN_HEADER, ROLE.ROW_HEADER, ROLE.TABLE_COLUMN_HEADER,
-            ROLE.TABLE_ROW_HEADER}
+INTERACTIVE = {ROLE.PUSH_BUTTON, ROLE.PUSH_BUTTON_MENU, ROLE.TOGGLE_BUTTON, ROLE.CHECK_BOX,
+               ROLE.RADIO_BUTTON, ROLE.MENU, ROLE.MENU_ITEM, ROLE.CHECK_MENU_ITEM,
+               ROLE.RADIO_MENU_ITEM, ROLE.PAGE_TAB, ROLE.COMBO_BOX, ROLE.SLIDER, ROLE.SPIN_BUTTON,
+               ROLE.DIAL, ROLE.SCROLL_BAR, ROLE.PROGRESS_BAR, ROLE.TREE_ITEM, ROLE.DESKTOP_ICON}
 if hasattr(ROLE, "SWITCH"):
-    CONTROLS.add(ROLE.SWITCH)
+    INTERACTIVE.add(ROLE.SWITCH)
+CONTROLS = INTERACTIVE | {ROLE.TABLE_ROW, ROLE.COLUMN_HEADER, ROLE.ROW_HEADER,
+                          ROLE.TABLE_COLUMN_HEADER, ROLE.TABLE_ROW_HEADER}
 LABELS = CONTROLS | {ROLE.LINK, ROLE.LABEL, ROLE.STATIC, ROLE.IMAGE, ROLE.ICON, ROLE.LIST_ITEM,
                      ROLE.TABLE_CELL, ROLE.HEADING, ROLE.TEXT, ROLE.CAPTION, ROLE.STATUS_BAR}
 POPUPS = {ROLE.ALERT, ROLE.DIALOG, ROLE.NOTIFICATION, ROLE.POPUP_MENU, ROLE.TOOL_TIP}
-CONTAINERS = POPUPS | {ROLE.FILLER, ROLE.GROUPING, ROLE.INFO_BAR, ROLE.LIST, ROLE.LIST_BOX,
-                       ROLE.MENU_BAR, ROLE.PANEL, ROLE.SECTION, ROLE.TOOL_BAR}
 WINDOW_ROLES = {ROLE.FRAME, ROLE.DIALOG, ROLE.WINDOW}
+TEXT_TARGETS = LABELS | {ROLE.PARAGRAPH, ROLE.BLOCK_QUOTE, ROLE.ENTRY, ROLE.TERMINAL}
+PROSE_EXCLUDED = INTERACTIVE | {ROLE.ENTRY, ROLE.TERMINAL, ROLE.TOOL_BAR, ROLE.MENU_BAR, ROLE.STATUS_BAR}
 MARK = "\ufffc"
 
 
@@ -105,11 +105,16 @@ class Surface:
     dy: int
 
     @classmethod
-    def create(cls, node, window):
+    def create(cls, node, window, toolkit):
         client = Rect(*window["client"])
         screen = extents(node, SCREEN)
-        mode = SCREEN if screen.valid else WINDOW
-        reported = screen if screen.valid else extents(node, WINDOW)
+        mode, reported = SCREEN, screen
+        # GTK on Wayland can return a valid size with a zero screen origin
+        # for every widget. Window coordinates retain the widgets' offsets.
+        if not screen.valid or (toolkit == "gtk" and (screen.x, screen.y) == (0, 0)):
+            local = extents(node, WINDOW)
+            if local.valid or not screen.valid:
+                mode, reported = WINDOW, local
         origins = window_rects(window)
         origin = min(origins, key=lambda r: abs(r.w - reported.w) + abs(r.h - reported.h))
         return cls(node, client if client.valid else origin, mode,
@@ -126,23 +131,25 @@ class Surface:
     def _hits(self, node, x, y, visited, check, direct=False):
         check()
         visited.add(node)
+        bounds = extents(node, self.mode)
         if role(node) == ROLE.PASSWORD_TEXT:
-            yield node
+            if direct or bounds.contains(x, y):
+                yield node
             return
         if attempt(node.get_component_iface) is not None:
             target = attempt(A.Component.get_accessible_at_point, node, x, y, self.mode)
             if target is not None and target not in visited and has(target, STATE.SHOWING):
-                bounds = extents(target, self.mode)
-                if not bounds.valid or bounds.contains(x, y):
+                target_bounds = extents(target, self.mode)
+                if not target_bounds.valid or target_bounds.contains(x, y):
                     yield from self._hits(target, x, y, visited, check, direct=True)
         for child in reversed(list(children(node))):
             check()
             if child in visited or not has(child, STATE.SHOWING):
                 continue
-            bounds = extents(child, self.mode)
-            if bounds.contains(x, y) or not bounds.valid:
+            child_bounds = extents(child, self.mode)
+            if child_bounds.contains(x, y) or (not child_bounds.valid and attempt(child.get_child_count, default=0)):
                 yield from self._hits(child, x, y, visited, check)
-        if direct or node == self.node or extents(node, self.mode).contains(x, y):
+        if bounds.contains(x, y):
             yield node
 
     def offset(self, node, point, size):
@@ -247,42 +254,45 @@ def surface_for(window, check):
     origins = window_rects(window)
     if not origins:
         return None
+    desktop = attempt(A.get_desktop, 0)
+    if desktop is None:
+        return None
     popup = window.get("popup", False)
     roots = []
-    for app in children(A.get_desktop(0)):
+    for app in children(desktop):
         check()
         if attempt(app.get_process_id) != window["pid"]:
             continue
-        chromium = attempt(app.get_toolkit_name, default="").lower() in {"chromium", "chrome", "electron"}
+        toolkit = attempt(app.get_toolkit_name, default="").lower()
         for node in children(app):
             check()
             if has(node, STATE.SHOWING) or has(node, STATE.ACTIVE):
-                roots.append((node, chromium))
+                roots.append((node, toolkit))
 
     def best(nodes):
         candidates = []
-        for node, chromium in nodes:
+        for node, toolkit in nodes:
             check()
             score = surface_score(node, window["title"], origins, popup)
             if score is not None:
-                candidates.append((score, node, chromium))
+                candidates.append((score, node, toolkit))
         return max(candidates, key=lambda item: item[0], default=None)
 
     match = best(roots)
     if popup and match is None:
         # Some toolkits report a separate popup surface as part of the owner window's tree.
-        match = best((node, chromium) for root, chromium in roots
+        match = best((node, toolkit) for root, toolkit in roots
                      for node in visible_nodes(root, check) if role(node) in POPUPS | {ROLE.MENU})
     if match is None:
         return None
-    _, node, chromium = match
-    if chromium:
+    _, node, toolkit = match
+    if toolkit in {"chromium", "chrome", "electron"}:
         # Chromium enables the renderer accessibility tree on an ATK
         # attribute query. Give the renderer a cycle to publish its tree.
         attempt(node.get_attributes)
         time.sleep(0.08)
         check()
-    return Surface.create(node, window)
+    return Surface.create(node, window, toolkit)
 
 
 def surface_score(node, title, origins, popup):
@@ -355,19 +365,21 @@ def scope_for(node, link=False):
 
 
 class Flow:
-    def __init__(self, check, visible_only=False):
+    def __init__(self, check, visible_only=False, prose=False):
         self.check = check
         self.visible_only = visible_only
+        self.prose = prose
         self.pieces = []
         self.seen = set()
 
     def append(self, node, start=0, end=None, boundary=True, selected=False):
         self.check()
-        if (node in self.seen or role(node) == ROLE.PASSWORD_TEXT
+        kind = role(node)
+        if (node in self.seen or kind == ROLE.PASSWORD_TEXT
+                or (self.prose and (kind in PROSE_EXCLUDED or has(node, STATE.EDITABLE)))
                 or (self.visible_only and not has(node, STATE.SHOWING))):
             return
         self.seen.add(node)
-        kind = role(node)
         value = text_of(node)
         limit = len(value) if end is None else min(end, len(value))
         if boundary and kind in BLOCKS:
@@ -485,6 +497,8 @@ def text_start(surface, branch, point):
                   {ROLE.PARAGRAPH, ROLE.HEADING, ROLE.LIST_ITEM, ROLE.TABLE_CELL}), None)
     candidates = branch if block is None or branch[0] == block else [block, *branch]
     for node in candidates:
+        if role(node) not in TEXT_TARGETS or not surface.box(node).contains(*point):
+            continue
         value = text_of(node)
         if not value.strip():
             continue
@@ -555,7 +569,6 @@ def resolve(request, check):
 
 
 def pointer_reading(surface, point, check, focus=None):
-    containers = {}
     for hit in surface.hits(point, check):
         branch = list(ancestry(hit, surface.node))
         kinds = [role(node) for node in branch]
@@ -565,12 +578,16 @@ def pointer_reading(surface, point, check, focus=None):
             value = text_of(focus)
             offset = attempt(A.Text.get_caret_offset, focus, default=-1) if value else -1
             if 0 <= offset < len(value):
-                return reading_from(surface, "caret", check, focus, offset)
+                reading = reading_from(surface, "caret", check, focus, offset)
+                if readable(reading.pieces):
+                    return reading
 
         in_document = any(kind in DOCUMENTS for kind in kinds)
         for node, kind in zip(branch, kinds):
             if kind in DOCUMENTS:
                 break
+            if not surface.box(node).contains(*point):
+                continue
             if kind == ROLE.LINK:
                 reading = reading_from(surface, "pointer", check, node, 0, True)
                 if readable(reading.pieces):
@@ -580,29 +597,29 @@ def pointer_reading(surface, point, check, focus=None):
                 if readable(reading.pieces):
                     return reading
 
+        if not in_document and kinds[0] in {ROLE.LABEL, ROLE.STATIC}:
+            reading = element_reading(surface, hit, check)
+            if readable(reading.pieces):
+                return reading
+
         start = text_start(surface, branch, point)
         if start:
             reading = reading_from(surface, "pointer", check, *start)
             if readable(reading.pieces):
                 return reading
 
-        for node, kind in zip(branch, kinds):
-            if kind in DOCUMENTS or kind in {ROLE.APPLICATION, ROLE.DESKTOP_FRAME}:
-                break
-            if kind in LABELS | BLOCKS:
-                reading = reading_from(surface, "pointer", check, node, 0)
-                if readable(reading.pieces):
-                    return reading
-            elif kind in CONTAINERS and (node != surface.node or kind in POPUPS):
-                containers[node] = None
-            elif node == hit and node != surface.node and kind not in WINDOW_ROLES:
-                name = attempt(node.get_name, default="")
-                if name.strip():
-                    return Reading(surface, [Piece(name, node, -1)], "element")
-    for node in containers:
-        reading = element_reading(surface, node, check)
-        if readable(reading.pieces):
-            return reading
+        if in_document and kinds[0] in {ROLE.LABEL, ROLE.STATIC, ROLE.HEADING} and text_of(hit).strip():
+            reading = reading_from(surface, "pointer", check, hit, 0)
+            if readable(reading.pieces):
+                return reading
+        if kinds[0] in TEXT_TARGETS - BLOCKS:
+            reading = element_reading(surface, hit, check)
+            if readable(reading.pieces):
+                return reading
+        if not in_document and kinds[0] in POPUPS:
+            name = attempt(hit.get_name, default="")
+            if name.strip():
+                return Reading(surface, [Piece(name, hit, -1)], "element")
     return None
 
 
@@ -624,6 +641,6 @@ def element_reading(surface, node, check):
 
 
 def reading_from(surface, mode, check, node, offset, link=False):
-    flow = Flow(check)
+    flow = Flow(check, prose=mode == "pointer" and not editable(node))
     flow.from_node(node, offset, scope_for(node, link))
     return Reading(surface, flow.pieces, mode)

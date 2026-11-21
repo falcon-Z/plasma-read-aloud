@@ -1,6 +1,6 @@
 """Recognize visible text near the pointer when accessibility exposes no text."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import csv
 import io
 from itertools import groupby, takewhile
@@ -98,6 +98,42 @@ def at_point(words, point):
         if dx <= 12 and dy <= 8:
             nearest.append((dx ** 2 + dy ** 2, i))
     return words[min(nearest)[1]:] if nearest else []
+
+
+def paragraph_at(words, point):
+    matches = at_point(words, point)
+    if not matches:
+        return []
+    paragraph = matches[0].paragraph
+    paragraph_words = takewhile(lambda word: word.paragraph == paragraph, matches)
+    result = []
+    previous_row = None
+    for key, group in groupby(paragraph_words, key=lambda word: word.line):
+        line = list(group)
+        first = line[0]
+        reference = max(line, key=lambda word: word.box.w).box
+        if previous_row is not None:
+            if reference.y < previous_row.y + previous_row.h / 2:
+                continue
+            gap = reference.y - (previous_row.y + previous_row.h)
+            if gap > max(12, max(reference.h, previous_row.h) * 1.4):
+                break
+        previous_row = reference
+        # A change of font, such as a bold shortcut, can split one visible
+        # line into multiple OCR blocks. Join only close words on that row.
+        candidates = []
+        for word in words:
+            box = word.box
+            overlap = min(box.y + box.h, reference.y + reference.h) - max(box.y, reference.y)
+            if box.x > first.box.x and overlap >= min(box.h, reference.h) / 2:
+                candidates.append(word)
+        result.append(first)
+        for word in sorted(candidates, key=lambda word: word.box.x):
+            previous = result[-1].box
+            if word.box.x - (previous.x + previous.w) > max(14, min(36, reference.h * 2)):
+                break
+            result.append(replace(word, paragraph=paragraph, line=key))
+    return result
 
 
 def command(argv, cancel, seconds, payload=None, env=None):
@@ -223,11 +259,7 @@ def recognize(image, tesseract, language, layout, bounds, point, cancel):
     if not output:
         return []
     size = image.get_width(), image.get_height()
-    words = at_point(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
-    if not words:
-        return []
-    paragraph = words[0].paragraph
-    return list(takewhile(lambda word: word.paragraph == paragraph, words))
+    return paragraph_at(parse(output.decode("utf-8", errors="replace"), size, bounds), point)
 
 
 def capture(request, base, cancel):
@@ -243,7 +275,7 @@ def capture(request, base, cancel):
         tesseract = str(local)
     if not tesseract:
         return None
-    x, y = point
+    _, y = point
     bounds = bounds.intersect(Rect(bounds.x, y - 120, bounds.w, 480))
     image = capture_area(bounds, cancel)
     if image is None:
@@ -256,8 +288,8 @@ def capture(request, base, cancel):
     if words:
         return ImageReading(words)
 
-    # Retry on an enlarged tile around small or sparsely laid out text.
-    tile = bounds.intersect(Rect(x - 360, y - 48, 721, 97))
+    # Keep the window's line width so the retry can read past the cursor.
+    tile = bounds.intersect(Rect(bounds.x, y - 64, bounds.w, 256))
     detail = crop(image, bounds, tile)
     if detail is None:
         return None
